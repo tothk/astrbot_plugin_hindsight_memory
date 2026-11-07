@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 from datetime import datetime, date
 from astrbot.api.event import filter, AstrMessageEvent
@@ -48,7 +49,8 @@ class MyPlugin(Star):
         if message_str != "":
             persona_id = await persona_from_conversation(self.context, event)
             try:
-                self._sql.insert_raw(
+                await asyncio.to_thread(
+                    self._sql.insert_raw,
                     RawMessage(
                         record_date=date.today().isoformat(),
                         document_id=f"{date.today().isoformat()}:{event.unified_msg_origin}",
@@ -57,7 +59,7 @@ class MyPlugin(Star):
                         role="user",
                         raw_message=message_str,
                         message_sent_time=datetime.now().astimezone().isoformat(timespec="seconds"),
-                    )
+                    ),
                 )
                 self._db_warned = False
             except Exception as e:
@@ -91,7 +93,8 @@ class MyPlugin(Star):
             bot_id = event.get_platform_id()
         persona_id = await persona_for_reply(self.context, event)
         try:
-            self._sql.insert_raw(
+            await asyncio.to_thread(
+                self._sql.insert_raw,
                 RawMessage(
                     record_date=date.today().isoformat(),
                     document_id=f"{date.today().isoformat()}:{event.unified_msg_origin}",
@@ -100,7 +103,7 @@ class MyPlugin(Star):
                     role="llm",
                     raw_message=raw_message,
                     message_sent_time=datetime.now().astimezone().isoformat(timespec="seconds"),
-                )
+                ),
             )
             self._db_warned = False
         except Exception as e:
