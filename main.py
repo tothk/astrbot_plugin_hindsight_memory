@@ -1,6 +1,5 @@
-import asyncio
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
 from astrbot.api.event import MessageChain
@@ -11,9 +10,9 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from .config.config_manager import ConfigManager
 from .config.plugin_paths import PluginPaths
 from .db.models.sql_model_manager import SqlModelManager
-from .db.models.models import RawMessage
 from astrbot.api import logger
 from .core.persona import persona_for_reply, persona_from_conversation
+from .core.recorder import Recorder, build_raw_message
 
 
 # 插件元数据由 metadata.yaml 提供。AstrBot 3.5.19+ 会自动识别继承 Star 的插件类，
@@ -26,7 +25,7 @@ class MyPlugin(Star):
         self._plugin_paths = PluginPaths(self.PLUGIN_DATA_PATH)
         self._config_manager = ConfigManager(self._plugin_paths)
         self._sql = SqlModelManager(self._plugin_paths)
-        self._db_warned = False
+        self._recorder = Recorder(self._sql, logger.error)
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
@@ -36,6 +35,21 @@ class MyPlugin(Star):
 
         # 插件卸载/停用时的清理。
         self._sql.close()
+
+    async def _notify_save_failed(self, event: AstrMessageEvent):
+        """记录写入失败时提示用户，避免记忆静默缺失。
+
+        必须走 context.send_message 而不是 event.send：后者会把
+        _has_send_oper 置为 True，导致本轮的正式回复被这条提示顶掉。
+        节流（只在首次失败时提示）由 Recorder 内部负责。
+
+        Args:
+            event: 触发本次记录的事件，用于定位会话。
+        """
+        await self.context.send_message(
+            event.unified_msg_origin,
+            MessageChain([Plain("⚠️ 本条对话记录保存失败，后续记忆可能不完整。")]),
+        )
 
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def on_private_message(self, event: AstrMessageEvent):
@@ -48,28 +62,18 @@ class MyPlugin(Star):
         # if message_str != "":
         if message_str != "":
             persona_id = await persona_from_conversation(self.context, event)
-            try:
-                await asyncio.to_thread(
-                    self._sql.insert_raw,
-                    RawMessage(
-                        record_date=date.today().isoformat(),
-                        document_id=f"{date.today().isoformat()}:{event.unified_msg_origin}",
-                        sender_id=event.get_sender_id(),
-                        persona_id=persona_id or "",
-                        role="user",
-                        raw_message=message_str,
-                        message_sent_time=datetime.now().astimezone().isoformat(timespec="seconds"),
-                    ),
-                )
-                self._db_warned = False
-            except Exception as e:
-                logger.error(f"写入原始记录失败: {e}")
-                if not self._db_warned:  # ← 只有第一次失败才提示
-                    self._db_warned = True
-                    await self.context.send_message(
-                        event.unified_msg_origin,
-                        MessageChain([Plain("⚠️ 本条对话记录保存失败，后续记忆可能不完整。")]),
-                    )
+            # 记录用户这一侧；notify 用 lambda 延迟求值，只有真的写失败才会发提示。
+            await self._recorder.save(
+                build_raw_message(
+                    role="user",
+                    sender_id=event.get_sender_id(),
+                    text=message_str,
+                    umo=event.unified_msg_origin,
+                    persona_id=persona_id or "",
+                    now=datetime.now(),
+                ),
+                lambda: self._notify_save_failed(event),
+            )
 
     @filter.on_llm_response()
     async def on_llm_resp(
@@ -92,25 +96,15 @@ class MyPlugin(Star):
         if not bot_id or bot_id == "unknown_selfid":
             bot_id = event.get_platform_id()
         persona_id = await persona_for_reply(self.context, event)
-        try:
-            await asyncio.to_thread(
-                self._sql.insert_raw,
-                RawMessage(
-                    record_date=date.today().isoformat(),
-                    document_id=f"{date.today().isoformat()}:{event.unified_msg_origin}",
-                    sender_id=bot_id,
-                    persona_id=persona_id or "",
-                    role="llm",
-                    raw_message=raw_message,
-                    message_sent_time=datetime.now().astimezone().isoformat(timespec="seconds"),
-                ),
-            )
-            self._db_warned = False
-        except Exception as e:
-            logger.error(f"写入原始记录失败: {e}")
-            if not self._db_warned:  # ← 只有第一次失败才提示
-                self._db_warned = True
-                await self.context.send_message(
-                    event.unified_msg_origin,
-                    MessageChain([Plain("⚠️ 本条对话记录保存失败，后续记忆可能不完整。")]),
-                )
+        # 记录机器人这一侧；sender_id 是机器人自己，不是提问的用户。
+        await self._recorder.save(
+            build_raw_message(
+                role="llm",
+                sender_id=bot_id,
+                text=raw_message,
+                umo=event.unified_msg_origin,
+                persona_id=persona_id or "",
+                now=datetime.now(),
+            ),
+            lambda: self._notify_save_failed(event),
+        )
