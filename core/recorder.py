@@ -16,6 +16,68 @@ if TYPE_CHECKING:
     from ..db.models.sql_model_manager import SqlModelManager
 
 
+def should_record_user_text(text: str) -> bool:
+    """判断一条用户消息是否应当记录。
+
+    空文本（纯图片等非文本消息）与指令不记录：指令属于操作行为，
+    写进记忆会污染下游的事实提取。
+
+    Args:
+        text: 经过 get_message_outline() 转换后的消息正文。
+
+    Returns:
+        True 表示应当记录。
+    """
+    return text != "" and not text.startswith(("/", "／"))
+
+
+def should_record_reply(
+    *,
+    role: str,
+    text: str,
+    is_private: bool,
+    stopped: bool,
+    stop_requested: bool,
+) -> bool:
+    """判断一条机器人回复是否应当记录。
+
+    需要排除四种情况：出错回复（role 为 "err"）、被用户打断的回复
+    （此时 completion_text 是占位文本 "Output stopped."）、空回复、
+    以及非私聊会话。
+
+    Args:
+        role: LLMResponse.role。
+        text: LLMResponse.completion_text。
+        is_private: 是否私聊会话。
+        stopped: 事件是否已被停止。
+        stop_requested: 是否被标记了停止请求。
+
+    Returns:
+        True 表示应当记录。
+    """
+    if not is_private or role == "err" or not text:
+        return False
+    return not (stopped or stop_requested)
+
+
+def resolve_bot_id(self_id: str, platform_id: str) -> str:
+    """确定机器人自身的 ID。
+
+    部分适配器拿不到 self_id，会返回空串或固定的 unknown_selfid，
+    此时退回平台适配器 ID 占位。
+
+    Args:
+        self_id: event.message_obj.self_id。
+        platform_id: event.get_platform_id()。
+
+    Returns:
+        可写入记录的机器人标识。
+    """
+    if not self_id or self_id == "unknown_selfid":
+        return platform_id
+    return self_id
+
+
 def build_raw_message(
     *,
     role: str,
