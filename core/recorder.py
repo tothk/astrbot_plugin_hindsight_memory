@@ -17,6 +17,19 @@ if TYPE_CHECKING:
     from ..db.models.sql_model_manager import SqlModelManager
 
 
+# 用户打断生成时，AstrBot 会造一条 role="assistant"、正文恰好是这个字符串的
+# 伪回复（astrbot/core/agent/runners/tool_loop_agent_runner.py:118 的
+# USER_INTERRUPTION_MESSAGE，由 :1573 _finalize_aborted_step() 构造），
+# 并且照样调用 on_agent_done 通知插件 —— 也就是说它会以正常回复的身份
+# 到达 on_llm_response 钩子。
+#
+# 光靠 event.is_stopped() / agent_stop_requested 挡不住：钩子被调用的时刻，
+# astrbot/core/astr_agent_run_util.py 的 aborted 分支已经 clear_result() 清掉
+# stopped、并把 agent_stop_requested 复位成 False，插件看到的两个信号都可能是假。
+# 所以这里再加一条纯文本判据：正文正好是这句占位符，就一定不是模型说的话。
+USER_INTERRUPTION_MESSAGE = "Output stopped."
+
+
 class Logger(Protocol):
     """本模块用到的最小日志接口。
 
@@ -56,13 +69,13 @@ def should_record_reply(
 ) -> bool:
     """判断一条机器人回复是否应当记录。
 
-    需要排除四种情况：出错回复（role 为 "err"）、被用户打断的回复
+    需要排除五种情况：出错回复（role 为 "err"）、被用户打断的回复
     （此时 completion_text 是占位文本 "Output stopped."）、空回复、
-    以及非私聊会话。
+    非私聊会话，以及事件上残留的停止信号。
 
     Args:
         role: LLMResponse.role。
-        text: LLMResponse.completion_text。
+        text: 经过 reply_text() 取到的回复正文。
         is_private: 是否私聊会话。
         stopped: 事件是否已被停止。
         stop_requested: 是否被标记了停止请求。
@@ -71,6 +84,9 @@ def should_record_reply(
         True 表示应当记录。
     """
     if not is_private or role == "err" or not text:
+        return False
+    # 占位文本判定放在停止信号之前：符号信号不可靠时这条仍然成立。
+    if text.strip() == USER_INTERRUPTION_MESSAGE:
         return False
     return not (stopped or stop_requested)
 

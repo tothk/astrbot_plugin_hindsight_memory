@@ -110,6 +110,52 @@ class TestShouldRecordReply:
             is False
         )
 
+    def test_interruption_placeholder_is_skipped_even_without_stop_signal(self):
+        """打断占位文本必须靠正文本身挡住。
+
+        用户点停止时 AstrBot 会造一条 role="assistant"、正文为
+        "Output stopped." 的伪回复，并且照样触发 on_llm_response 钩子。
+        钩子运行时 astrbot/core/astr_agent_run_util.py 的 aborted 分支
+        已经把 stopped 清掉、把 agent_stop_requested 复位成 False，
+        两个符号信号都可能是假 —— 这时只能靠正文判定。
+        """
+        assert (
+            should_record_reply(
+                role="assistant",
+                text="Output stopped.",
+                is_private=True,
+                stopped=False,
+                stop_requested=False,
+            )
+            is False
+        )
+
+    def test_interruption_placeholder_with_surrounding_space_is_skipped(self):
+        # 用 strip() 比较，避免占位符前后多出空格/换行时漏判。
+        assert (
+            should_record_reply(
+                role="assistant",
+                text="  Output stopped.\n",
+                is_private=True,
+                stopped=False,
+                stop_requested=False,
+            )
+            is False
+        )
+
+    def test_reply_containing_the_placeholder_is_still_recorded(self):
+        # 只有正文「正好」是占位符才跳过；模型正常谈论停止时不该误伤。
+        assert (
+            should_record_reply(
+                role="assistant",
+                text="你说 Output stopped. 是什么意思？",
+                is_private=True,
+                stopped=False,
+                stop_requested=False,
+            )
+            is True
+        )
+
 
 class TestResolveBotId:
     def test_normal_self_id_is_used(self):
