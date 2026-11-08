@@ -6,7 +6,6 @@ from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Plain
 from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-from astrbot.api import logger
 from .config.config_manager import ConfigManager
 from .config.plugin_paths import PluginPaths
 from .db.models.sql_model_manager import SqlModelManager
@@ -23,18 +22,25 @@ class MyPlugin(Star):
         self.PLUGIN_DATA_PATH = Path(get_astrbot_data_path()) / "plugin_data" / self.name
         self._plugin_paths = PluginPaths(self.PLUGIN_DATA_PATH)
         self._config_manager = ConfigManager(self._plugin_paths)
-        self._sql = SqlModelManager(self._plugin_paths)
-        self._recorder = Recorder(self._sql, logger.error)
-        self._capture = MessageCapture(self.context, self._recorder, self._notify_save_failed)
+        # self.logger 是 AstrBot 为本插件单独准备的 logger（面板里可单独调级别），
+        # 比模块级的 astrbot 全局 logger 更适合记录运行期信息。
+        self._sql = SqlModelManager(self._plugin_paths, self.logger)
+        self._recorder = Recorder(self._sql, self.logger)
+        self._capture = MessageCapture(
+            self.context, self._recorder, self._notify_save_failed, self.logger
+        )
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+        # 用插件专属 logger：面板里可以单独调它的级别，不会淹没在全局日志里。
+        self.logger.info("Hindsight 记忆储存插件已加载，开始记录原始对话。")
 
     async def terminate(self):
         """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
 
         # 插件卸载/停用时的清理。
         self._sql.close()
+        self.logger.info("Hindsight 记忆储存插件已停止记录。")
 
     async def _notify_save_failed(self, event: AstrMessageEvent):
         """记录写入失败时提示用户，避免记忆静默缺失。

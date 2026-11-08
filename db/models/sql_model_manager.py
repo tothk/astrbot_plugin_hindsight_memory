@@ -8,8 +8,15 @@ from .p_base_model import PBaseModel
 class SqlModelManager:
     _DB_FILENAME = "raw_message.db"
 
-    def __init__(self, plugin_paths: PluginPaths) -> None:
+    def __init__(self, plugin_paths: PluginPaths, log=None) -> None:
+        """初始化引擎、挂 WAL 并建表。
+
+        Args:
+            plugin_paths: 提供 sqlitedb_dir 的路径对象。
+            log: 可选的日志对象（提供 info/error），用于记录库文件位置与建表结果。
+        """
         db_file = plugin_paths.sqlitedb_dir / self._DB_FILENAME
+        self._log = log
         self._engine: Engine = create_engine(
             f"sqlite:///{db_file.as_posix()}",
             # astrbot 的钩子可能在不同线程里跑，关掉同线程检查
@@ -24,6 +31,9 @@ class SqlModelManager:
             cur.execute("PRAGMA synchronous=NORMAL")
             cur.close()
         PBaseModel.metadata.create_all(self._engine)
+        # 实测期间最常需要确认的就是"库到底落在哪"，启动时打一次即可。
+        if self._log is not None:
+            self._log.info(f"原始对话库位置: {db_file}")
 
     def insert_raw(self, raw: RawMessage) -> RawMessage | None:
         """插入一条原始消息，返回带 id 的对象。

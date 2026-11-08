@@ -15,6 +15,7 @@ from astrbot.core.provider.entities import LLMResponse
 
 from .persona import persona_for_reply, persona_from_conversation
 from .recorder import (
+    Logger,
     Recorder,
     build_raw_message,
     resolve_bot_id,
@@ -33,6 +34,7 @@ class MessageCapture:
         context: Context,
         recorder: Recorder,
         notify_failed: NotifyFunc,
+        log: Logger,
     ) -> None:
         """初始化。
 
@@ -41,10 +43,12 @@ class MessageCapture:
             recorder: 负责落库与失败节流的记录器。
             notify_failed: 写入失败时的异步回调，接收触发本次记录的事件，
                 由 main.py 提供，用于把提示发回给用户。
+            log: 日志对象，通常是插件专属 logger。
         """
         self._context = context
         self._recorder = recorder
         self._notify_failed = notify_failed
+        self._log = log
 
     async def capture_user(self, event: AstrMessageEvent) -> None:
         """记录用户发送的消息；不满足记录条件时静默返回。
@@ -54,6 +58,8 @@ class MessageCapture:
         """
         message_str = event.get_message_outline()
         if not should_record_user_text(message_str):
+            # 实测时最容易被误判成"漏记"的就是这里，打一行 debug 便于对账。
+            self._log.debug(f"跳过用户消息（空文本或指令）: {message_str[:20]!r}")
             return
         persona_id = await persona_from_conversation(self._context, event)
         await self._recorder.save(
@@ -82,6 +88,11 @@ class MessageCapture:
             stopped=event.is_stopped(),
             stop_requested=bool(event.get_extra("agent_stop_requested")),
         ):
+            self._log.debug(
+                f"跳过回复记录 role={resp.role} "
+                f"stopped={event.is_stopped()} "
+                f"len={len(resp.completion_text or '')}"
+            )
             return
         bot_id = resolve_bot_id(
             event.message_obj.self_id,

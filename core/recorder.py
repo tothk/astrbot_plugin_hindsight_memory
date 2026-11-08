@@ -7,7 +7,7 @@
 import asyncio
 import hashlib
 from datetime import datetime
-from typing import TYPE_CHECKING, Awaitable, Callable
+from typing import TYPE_CHECKING, Awaitable, Callable, Protocol
 
 from ..db.models.models import RawMessage
 
@@ -15,6 +15,20 @@ from ..db.models.models import RawMessage
 # 避免本模块被导入时顺带拉起引擎相关的依赖。
 if TYPE_CHECKING:
     from ..db.models.sql_model_manager import SqlModelManager
+
+
+class Logger(Protocol):
+    """本模块用到的最小日志接口。
+
+    astrbot 的 logger 是 LoggerAdapter，标准库的 Logger 也满足这个形状。
+    用 Protocol 而不是直接 import astrbot，是为了让本模块保持无宿主依赖。
+    """
+
+    def debug(self, msg: str) -> None: ...
+
+    def info(self, msg: str) -> None: ...
+
+    def error(self, msg: str) -> None: ...
 
 
 def should_record_user_text(text: str) -> bool:
@@ -148,12 +162,13 @@ class Recorder:
     一旦写入成功，_warned 复位，下次故障可以再次通知。
     """
 
-    def __init__(self, sql: "SqlModelManager", log: Callable[[str], None]) -> None:
+    def __init__(self, sql: "SqlModelManager", log: Logger) -> None:
         """初始化。
 
         Args:
             sql: 提供 insert_raw 的数据库管理器。
-            log: 日志函数，通常是 logger.error。
+            log: 日志对象，通常是 astrbot 的 logger。按对象注入而不是直接
+                import astrbot.api，这样本模块仍可在没有宿主的测试里使用。
         """
         self._sql = sql
         self._log = log
@@ -175,13 +190,28 @@ class Recorder:
             # 同步的 Session + commit 不能直接放在事件循环里：
             # 抢不到 sqlite 写锁时会阻塞整个线程（最长 connect_args timeout 秒），
             # 连心跳与其它会话一起停摆，所以移到工作线程执行。
-            await asyncio.to_thread(self._sql.insert_raw, raw)
+            # 内容重复时 insert_raw 返回 None（唯一索引挡下），不是故障。
+            saved = await asyncio.to_thread(self._sql.insert_raw, raw)
         except Exception as e:
-            self._log(f"写入原始记录失败: {e}")
+            self._log.error(f"写入原始记录失败: {e}")
             if not self._warned:
                 self._warned = True
                 # 记录失败对陪伴场景不可接受，必须让用户看见；但只提示第一次。
                 await notify()
             return False
+        if saved is None:
+            # 同一天同一会话里内容完全相同的消息会被判重丢弃，这是设计行为。
+            # 打到 info 是为了实测时能对上"少了几行"，不必怀疑是漏记。
+            self._log.info(
+                f"内容重复，跳过写入 [{raw.role}] {raw.document_id} "
+                f"{raw.raw_message[:20]!r}"
+            )
+            self._warned = False
+            return True
+        self._log.info(
+            f"已记录 [{raw.role}] {raw.document_id} "
+            f"id={saved.id} persona={raw.persona_id or '(空)'} "
+            f"len={len(raw.raw_message)}"
+        )
         self._warned = False
         return True
