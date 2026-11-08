@@ -1,14 +1,17 @@
-# astrbot-plugin-helloworld
+# Hindsight 记忆储存
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+> 记录每一句私聊原始对话，并沉淀为 [Hindsight](https://github.com/tothk/astrbot_plugin_hindsight_memory) 长期记忆，让 AI 真正记得你。
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+面向**陪伴型 AI** 的 AstrBot 插件：先把「发生过什么」原封不动地存下来，再谈记忆。
+原始记录是长期记忆的地基——检索、摘要、遗忘都建立在它之上，所以这一层不做事后加工，只保证**完整、不重复、可追溯**。
 
-# Supports
+## 功能特性
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+- **全量记录**：私聊中用户发出的消息与机器人的回复，逐条写入本地 SQLite，一条不落。
+- **按天归档**：同一会话同一天的消息归入同一个 `document_id`（`2026-11-09:平台:类型:会话ID`），天然分段，方便下游按天提取事实。
+- **内容去重**：对 `document_id + role + 正文` 取 SHA-256 建唯一索引，事件重放或钩子重复触发不会写出重复行。
+- **失败可见**：写库失败不静默——用户会在会话里收到一条提示；同一故障只提醒一次，恢复后自动复位。
+- **零干扰**：只读通知，不改写、拦截或影响 AstrBot 的正常回复流程。
+- **非文本也留痕**：图片、表情、引用、转发等以 `[图片]`、`[表情:id]` 等占位符形式保留，不会因为“没有文字”而整条丢失。
+- **指令不入库**：`/reset` 这类插槽指令、以及被唤醒前缀触发的指令，不会被当成聊天内容记录下来。
+- **原子与并发安全**：SQLite 开启 WAL + 10 秒忙等超时，写入放在线程池里执行，不阻塞事件循环。
