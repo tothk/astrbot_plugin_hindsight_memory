@@ -138,7 +138,11 @@ def build_raw_message(
     Returns:
         尚未落库的 RawMessage。
     """
-    day = now.date().isoformat()
+    # 先换算到本机时区，再取日期：否则传进来的 now 若带别的时区（例如 UTC），
+    # record_date 会按那个时区的日期算，而 message_sent_time 却是本机时间，
+    # 跨零点的消息就会出现「日期是昨天、时间戳是今天」的自相矛盾。
+    local_now = now.astimezone()
+    day = local_now.date().isoformat()
     # 文档边界是一天：同一天同一会话的记录归入同一个 document_id，
     # 便于下游按天提取事实。umo 自带冒号，故这里用冒号分隔不会破坏解析。
     document_id = f"{day}:{umo}"
@@ -149,7 +153,7 @@ def build_raw_message(
         persona_id=persona_id,
         role=role,
         raw_message=text,
-        message_sent_time=now.astimezone().isoformat(timespec="seconds"),
+        message_sent_time=local_now.isoformat(timespec="seconds"),
         content_hash=content_hash(document_id, role, text),
     )
 
