@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import hashlib
 from datetime import datetime
 from typing import TYPE_CHECKING, Awaitable, Callable
 
@@ -78,6 +79,29 @@ def resolve_bot_id(self_id: str, platform_id: str) -> str:
     return self_id
 
 
+def content_hash(document_id: str, role: str, text: str) -> str:
+    """计算一条记录的去重指纹。
+
+    只纳入"消息本身"的属性：同一天同一会话（document_id）、说话方（role）、
+    正文（text）。时间与人格刻意排除——message_sent_time 是写入时刻，
+    重写同一事件会得到不同的秒数，纳入后去重永远不会命中；
+    persona_id 是派生值，可能为空也可能事后被修正。
+
+    代价：同一天同一会话里两段完全相同的正文会被判为重复而丢弃。
+
+    Args:
+        document_id: 文档标识，含日期与会话。
+        role: 说话方，"user" 或 "llm"。
+        text: 消息正文。
+
+    Returns:
+        十六进制的 sha256 摘要。
+    """
+    # 用 \x1f（ASCII 单元分隔符）拼接，避免字段内容自身含分隔符时产生歧义。
+    raw = f"{document_id}\x1f{role}\x1f{text}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def build_raw_message(
     *,
     role: str,
@@ -101,16 +125,18 @@ def build_raw_message(
         尚未落库的 RawMessage。
     """
     day = now.date().isoformat()
+    # 文档边界是一天：同一天同一会话的记录归入同一个 document_id，
+    # 便于下游按天提取事实。umo 自带冒号，故这里用冒号分隔不会破坏解析。
+    document_id = f"{day}:{umo}"
     return RawMessage(
         record_date=day,
-        # 文档边界是一天：同一天同一会话的记录归入同一个 document_id，
-        # 便于下游按天提取事实。umo 自带冒号，故这里用冒号分隔不会破坏解析。
-        document_id=f"{day}:{umo}",
+        document_id=document_id,
         sender_id=sender_id,
         persona_id=persona_id,
         role=role,
         raw_message=text,
         message_sent_time=now.astimezone().isoformat(timespec="seconds"),
+        content_hash=content_hash(document_id, role, text),
     )
 
 

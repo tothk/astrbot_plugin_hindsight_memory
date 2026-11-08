@@ -1,5 +1,6 @@
 from pathlib import Path
 from sqlalchemy import Engine, event
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, SQLModel, create_engine
 from ...config.plugin_paths import PluginPaths
 from .models import RawMessage
@@ -24,13 +25,29 @@ class SqlModelManager:
             cur.close()
         PBaseModel.metadata.create_all(self._engine)
 
-    def insert_raw(self, raw: RawMessage) -> RawMessage:
-        """插入一条原始消息，返回带 id 的对象。"""
-        with Session(self._engine) as session:
-            session.add(raw)
-            session.commit()
-            session.refresh(raw)
-            return raw
+    def insert_raw(self, raw: RawMessage) -> RawMessage | None:
+        """插入一条原始消息，返回带 id 的对象。
+
+        content_hash 上有唯一索引，同一份内容重复写入会触发 IntegrityError。
+        这里把它当作"已经记过了"吞掉并返回 None，而不是向上抛——重复不是故障，
+        不能因此给用户发"保存失败"的提示。
+
+        Args:
+            raw: 待插入的记录。
+
+        Returns:
+            插入成功返回带 id 的对象；内容重复已存在时返回 None。
+        """
+        try:
+            with Session(self._engine) as session:
+                session.add(raw)
+                session.commit()
+                session.refresh(raw)
+                return raw
+        except IntegrityError:
+            # 唯一索引冲突：这条内容此前已经记录过，视为成功。
+            return None
+
     def close(self) -> None:
         """关闭连接池，触发 WAL checkpoint。"""
         self._engine.dispose()

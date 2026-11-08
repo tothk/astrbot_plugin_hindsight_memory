@@ -14,4 +14,7 @@ class RawMessage(PBaseModel, table=True):
     role:str
     raw_message: str
     message_sent_time: str
+    # 去重指纹：由 document_id + role + raw_message 计算，不含时间与人格。
+    # 建唯一索引让数据库来挡重复，而不是靠"先查再插"（并发下仍会重复）。
+    content_hash: str = Field(default="", index=True, unique=True)
     flushed: int = Field(default=0)
