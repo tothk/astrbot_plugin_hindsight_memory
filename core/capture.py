@@ -26,6 +26,29 @@ from .recorder import (
 NotifyFunc = Callable[[AstrMessageEvent], Awaitable[None]]
 
 
+def reply_text(resp: LLMResponse) -> str:
+    """取回复正文，非文本组件用占位符表示。
+
+    LLMResponse.completion_text 走的是 MessageChain.get_plain_text()，
+    默认 with_other_comps_mark=False —— 只收集 Plain 组件，图片、表情、
+    @ 等全部被丢掉。后果是"发一张图"这类回复在记忆里不可见，纯图片
+    回复更是变成空串被直接跳过、压根不入库。
+
+    这里显式传 with_other_comps_mark=True，让图片变成 "[Image]"、
+    表情变成 "[Face]" 之类的占位符，与用户侧的 get_message_outline()
+    口径保持一致。
+
+    Args:
+        resp: 本次 agent 运行产生的响应。
+
+    Returns:
+        可写入记录的回复正文；没有 result_chain 时退回 completion_text。
+    """
+    if resp.result_chain:
+        return resp.result_chain.get_plain_text(with_other_comps_mark=True)
+    return resp.completion_text or ""
+
+
 class MessageCapture:
     """负责「哪些消息要记、记哪些字段」的编排，具体落库交给 Recorder。"""
 
@@ -81,9 +104,12 @@ class MessageCapture:
             event: 触发本次回复的消息事件。
             resp: 本次 agent 运行产生的响应。
         """
+        # 先取正文再判守卫：纯图片回复经 reply_text() 后是 "[Image]" 而不是空串，
+        # 不会被误判成空回复而漏记。
+        text = reply_text(resp)
         if not should_record_reply(
             role=resp.role,
-            text=resp.completion_text,
+            text=text,
             is_private=event.get_message_type() == MessageType.FRIEND_MESSAGE,
             stopped=event.is_stopped(),
             stop_requested=bool(event.get_extra("agent_stop_requested")),
@@ -91,7 +117,7 @@ class MessageCapture:
             self._log.debug(
                 f"跳过回复记录 role={resp.role} "
                 f"stopped={event.is_stopped()} "
-                f"len={len(resp.completion_text or '')}"
+                f"len={len(text)}"
             )
             return
         bot_id = resolve_bot_id(
@@ -103,7 +129,7 @@ class MessageCapture:
             build_raw_message(
                 role="llm",
                 sender_id=bot_id,
-                text=resp.completion_text,
+                text=text,
                 umo=event.unified_msg_origin,
                 persona_id=persona_id or "",
                 now=datetime.now(),
