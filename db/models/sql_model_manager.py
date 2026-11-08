@@ -1,4 +1,3 @@
-from pathlib import Path
 from sqlalchemy import Engine, event
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, SQLModel, create_engine
@@ -29,6 +28,14 @@ class SqlModelManager:
             cur = dbapi_conn.cursor()
             cur.execute("PRAGMA journal_mode=WAL")
             cur.execute("PRAGMA synchronous=NORMAL")
+            # WAL 模式下写入先落在 -wal 文件，累积到 wal_autocheckpoint 页后
+            # 才搬回主库。默认 1000 页（约 4MB），对一个只追加对话的小库来说
+            # 太大：插件停用前主库可能一直是旧的，单拷 .db 会看不到最新记录。
+            # 单位是「页」而不是字节，100 页约 400KB。
+            cur.execute("PRAGMA wal_autocheckpoint=100")
+            # autocheckpoint 只把内容搬回主库，-wal 文件本身不会缩小，
+            # 会一直保持历史峰值。这条让它在搬完后截断到 1MB 以内。
+            cur.execute("PRAGMA journal_size_limit=1048576")
             cur.close()
         PBaseModel.metadata.create_all(self._engine)
         # 实测期间最常需要确认的就是"库到底落在哪"，启动时打一次即可。
