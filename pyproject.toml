@@ -1,2 +1,6 @@
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# 每个测试函数一个全新的事件循环：sqlite 连接与 asyncio 的对象都不跨 loop 复用，
+# 共享反而会踩到 "attached to a different loop" 这类问题。
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["test"]

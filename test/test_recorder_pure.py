@@ -1,0 +1,218 @@
+"""core/recorder.py 里纯函数的测试。
+
+这几个函数不碰数据库、不碰 AstrBot，输入输出都能手工验证，
+是这套测试里最便宜也最值钱的部分：抓取规则的每一次改动都会先在这里暴露。
+"""
+
+from datetime import datetime, timedelta, timezone
+
+from astrbot_plugin_hindsight_memory.core.recorder import (
+    build_raw_message,
+    content_hash,
+    resolve_bot_id,
+    should_record_reply,
+    should_record_user_text,
+)
+
+
+class TestShouldRecordUserText:
+    def test_normal_text_is_recorded(self):
+        assert should_record_user_text("今天好累啊") is True
+
+    def test_empty_text_is_skipped(self):
+        # 纯图片/表情消息经 get_message_outline() 后可能是空串。
+        assert should_record_user_text("") is False
+
+    def test_slash_command_is_skipped(self):
+        assert should_record_user_text("/reset") is False
+
+    def test_fullwidth_slash_command_is_skipped(self):
+        # 中文输入法下打出的全角斜杠，同样是指令。
+        assert should_record_user_text("／help") is False
+
+    def test_slash_in_the_middle_is_recorded(self):
+        # 只有开头的斜杠才算指令，正文里的斜杠不该误伤。
+        assert should_record_user_text("我们在 /tmp 下建个文件") is True
+
+
+class TestShouldRecordReply:
+    def test_normal_reply_is_recorded(self):
+        assert (
+            should_record_reply(
+                role="assistant",
+                text="我在呢",
+                is_private=True,
+                stopped=False,
+                stop_requested=False,
+            )
+            is True
+        )
+
+    def test_error_reply_is_skipped(self):
+        # agent 出异常时 AstrBot 会构造 role="err" 的响应。
+        assert (
+            should_record_reply(
+                role="err",
+                text="模型调用失败",
+                is_private=True,
+                stopped=False,
+                stop_requested=False,
+            )
+            is False
+        )
+
+    def test_empty_reply_is_skipped(self):
+        assert (
+            should_record_reply(
+                role="assistant",
+                text="",
+                is_private=True,
+                stopped=False,
+                stop_requested=False,
+            )
+            is False
+        )
+
+    def test_group_message_is_skipped(self):
+        # 本插件只服务一对一陪伴场景，群聊不记录。
+        assert (
+            should_record_reply(
+                role="assistant",
+                text="大家好",
+                is_private=False,
+                stopped=False,
+                stop_requested=False,
+            )
+            is False
+        )
+
+    def test_stopped_event_is_skipped(self):
+        assert (
+            should_record_reply(
+                role="assistant",
+                text="Output stopped.",
+                is_private=True,
+                stopped=True,
+                stop_requested=False,
+            )
+            is False
+        )
+
+    def test_stop_requested_is_skipped(self):
+        assert (
+            should_record_reply(
+                role="assistant",
+                text="Output stopped.",
+                is_private=True,
+                stopped=False,
+                stop_requested=True,
+            )
+            is False
+        )
+
+
+class TestResolveBotId:
+    def test_normal_self_id_is_used(self):
+        assert resolve_bot_id("123456", "platform-abc") == "123456"
+
+    def test_empty_self_id_falls_back_to_platform_id(self):
+        assert resolve_bot_id("", "platform-abc") == "platform-abc"
+
+    def test_unknown_self_id_falls_back_to_platform_id(self):
+        # 部分适配器拿不到机器人账号，会返回这个固定占位串。
+        assert resolve_bot_id("unknown_selfid", "platform-abc") == "platform-abc"
+
+
+class TestContentHash:
+    def test_same_content_gives_same_hash(self):
+        first = content_hash("2026-11-08:umo", "user", "嗯嗯")
+        second = content_hash("2026-11-08:umo", "user", "嗯嗯")
+        assert first == second
+
+    def test_hash_is_sha256_hex(self):
+        digest = content_hash("2026-11-08:umo", "user", "嗯嗯")
+        assert len(digest) == 64
+        assert all(c in "0123456789abcdef" for c in digest)
+
+    def test_different_role_differs(self):
+        # 同一句话由 user 说和由 llm 说，是两条记录。
+        assert content_hash("d", "user", "好") != content_hash("d", "llm", "好")
+
+    def test_different_document_differs(self):
+        # 换一天或换一个会话，就不再判重。
+        assert content_hash("d1", "user", "好") != content_hash("d2", "user", "好")
+
+    def test_field_boundaries_are_unambiguous(self):
+        # 没有分隔符时 "ab"+"c" 与 "a"+"bc" 会算出同一个指纹。
+        assert content_hash("ab", "c", "x") != content_hash("a", "bc", "x")
+
+
+class TestBuildRawMessage:
+    # 用一个"本地时区"的固定时刻：build_raw_message 会把传入时间换算到本机时区，
+    # 若这里传 UTC 的 21:30，在本机（+08:00）就变成次日 05:30，日期断言会飘。
+    LOCAL = datetime.now().astimezone().tzinfo
+    NOW = datetime(2026, 11, 8, 21, 30, 5, tzinfo=LOCAL)
+
+    def _build(self, **overrides):
+        kwargs = {
+            "role": "user",
+            "sender_id": "user-1",
+            "text": "今天好累啊",
+            "umo": "telegram:FriendMessage:42",
+            "persona_id": "persona-1",
+            "now": self.NOW,
+        }
+        kwargs.update(overrides)
+        return build_raw_message(**kwargs)
+
+    def test_fields_are_filled(self):
+        raw = self._build()
+        assert raw.role == "user"
+        assert raw.sender_id == "user-1"
+        assert raw.persona_id == "persona-1"
+        assert raw.raw_message == "今天好累啊"
+        assert raw.flushed == 0
+
+    def test_record_date_comes_from_now(self):
+        assert self._build().record_date == "2026-11-08"
+
+    def test_document_id_is_day_plus_umo(self):
+        # 文档边界是一天：同一天同一会话落进同一个 document_id。
+        assert self._build().document_id == "2026-11-08:telegram:FriendMessage:42"
+
+    def test_message_sent_time_is_local_isoformat(self):
+        raw = self._build()
+        # isoformat 带时区偏移与秒级精度，形如 2026-11-08T21:30:05+08:00。
+        assert raw.message_sent_time.startswith("2026-11-08T21:30:05")
+        assert raw.message_sent_time[19] in "+-"
+
+    def test_utc_input_is_converted_to_local(self):
+        # 传 UTC 时间也要落在本机时区的正确日期上。
+        utc_now = datetime(2026, 11, 8, 21, 30, 5, tzinfo=timezone.utc)
+        expected = utc_now.astimezone()
+        assert self._build(now=utc_now).record_date == expected.date().isoformat()
+
+    def test_record_date_matches_sent_time(self):
+        # record_date 与 message_sent_time 必须描述同一天，否则跨零点的消息
+        # 会出现「日期是昨天、时间戳是今天」，下游按天归档就会错。
+        for now in (
+            self.NOW,
+            datetime(2026, 11, 8, 23, 59, 59, tzinfo=timezone.utc),
+            datetime(2026, 11, 9, 0, 0, 1, tzinfo=timezone.utc),
+        ):
+            raw = self._build(now=now)
+            assert raw.record_date == raw.message_sent_time[:10]
+
+    def test_hash_matches_manual_computation(self):
+        raw = self._build()
+        assert raw.content_hash == content_hash(
+            raw.document_id, raw.role, raw.raw_message
+        )
+
+    def test_same_content_same_datetime_gives_same_hash(self):
+        # 这是去重能生效的前提：重复投递的同一事件算出同一指纹。
+        assert self._build().content_hash == self._build().content_hash
+
+    def test_different_day_gives_different_hash(self):
+        other = self._build(now=self.NOW + timedelta(days=1))
+        assert self._build().content_hash != other.content_hash
