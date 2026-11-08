@@ -12,7 +12,51 @@ from astrbot_plugin_hindsight_memory.core.recorder import (
     resolve_bot_id,
     should_record_reply,
     should_record_user_text,
+    strip_wake_prefix,
 )
+
+
+class TestStripWakePrefix:
+    def test_default_prefix_is_removed(self):
+        # AstrBot 只从 event.message_str 上剥前缀，outline 仍带着它。
+        assert strip_wake_prefix("/今天好累", ["/"]) == "今天好累"
+
+    def test_text_without_prefix_is_unchanged(self):
+        assert strip_wake_prefix("今天好累", ["/"]) == "今天好累"
+
+    def test_custom_prefix_is_removed(self):
+        # 前缀被改成 "!" 时，不剥会把 "!" 一起写进记忆。
+        assert strip_wake_prefix("!今天好累", ["!"]) == "今天好累"
+
+    def test_only_the_first_prefix_is_removed(self):
+        # 与 AstrBot 行为一致：命中即 break，不做循环剥离。
+        assert strip_wake_prefix("/!你好", ["/", "!"]) == "!你好"
+
+    def test_whitespace_after_prefix_is_stripped(self):
+        assert strip_wake_prefix("/  今天好累 ", ["/"]) == "今天好累"
+
+    def test_empty_prefix_is_ignored(self):
+        # 空前缀会让 startswith() 恒为真，必须跳过，否则正文会被整个吃掉。
+        assert strip_wake_prefix("今天好累", ["", "/"]) == "今天好累"
+
+    def test_empty_prefix_list_keeps_text(self):
+        # wake_prefix 配成 [] 表示不靠前缀唤醒，此时不该剥任何东西。
+        assert strip_wake_prefix("/今天好累", []) == "/今天好累"
+
+    def test_single_string_prefix_is_accepted(self):
+        # 配置被人手写成字符串时，不能按字符逐个当前缀。
+        assert strip_wake_prefix("/今天好累", "/") == "今天好累"
+
+    def test_bare_prefix_becomes_empty(self):
+        # 只发一个前缀，剥完是空串，交给 should_record_user_text 判空跳过。
+        assert strip_wake_prefix("/", ["/"]) == ""
+
+    def test_command_still_caught_after_stripping(self):
+        # /reset 剥掉前缀后是 "reset" —— 这正是要点：
+        # 剥前缀是为了让「聊天内容恰好以 / 开头」不被误杀，
+        # 而真正的指令由 AstrBot 的 CommandFilter 处理，不会走到这里。
+        text = strip_wake_prefix("/今天好累", ["/"])
+        assert should_record_user_text(text) is True
 
 
 class TestShouldRecordUserText:

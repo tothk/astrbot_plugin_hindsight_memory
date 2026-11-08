@@ -10,6 +10,7 @@
 包的层级结构，这一点不影响被测代码的行为。
 """
 
+import os
 import shutil
 import sys
 import uuid
@@ -21,6 +22,14 @@ PLUGIN_DIR = Path(__file__).resolve().parents[1]
 ASTRBOT_ROOT = PLUGIN_DIR.parents[2]
 # 测试用的临时目录根。放在插件目录里而不是系统临时目录，见 workdir 夹具的说明。
 TMP_ROOT = PLUGIN_DIR / ".test-tmp"
+
+# 必须在 import astrbot 之前设好：astrbot/core/__init__.py 一被导入就会
+# makedirs(get_astrbot_data_path())，并写 cmd_config.json、拷 t2i 模板。
+# 不设 ASTRBOT_ROOT 时它退回 os.getcwd()，于是插件目录里会凭空多出一个
+# data/（里面还有 dashboard 的默认凭据）。这里把它指到测试专用目录，
+# 跑测试就不会污染插件目录，也不会碰真实的 AstrBot 数据。
+os.environ["ASTRBOT_ROOT"] = str(TMP_ROOT / "astrbot_root")
+os.makedirs(os.environ["ASTRBOT_ROOT"], exist_ok=True)
 
 for _entry in (str(ASTRBOT_ROOT), str(PLUGIN_DIR.parent)):
     if _entry not in sys.path:

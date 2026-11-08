@@ -7,7 +7,7 @@
 import asyncio
 import hashlib
 from datetime import datetime
-from typing import TYPE_CHECKING, Awaitable, Callable, Protocol
+from typing import TYPE_CHECKING, Awaitable, Callable, Protocol, Sequence
 
 from ..db.models.models import RawMessage
 
@@ -44,18 +44,60 @@ class Logger(Protocol):
     def error(self, msg: str) -> None: ...
 
 
-def should_record_user_text(text: str) -> bool:
+def strip_wake_prefix(text: str, wake_prefixes: Sequence[str]) -> str:
+    """去掉消息开头的唤醒前缀。
+
+    AstrBot 收到消息后会先剥掉唤醒前缀，但它只改写 event.message_str，
+    不改 event.message_obj.message；而 get_message_outline() 读的是后者。
+    结果就是"带前缀的那段文本"会原样进入记忆：默认前缀是 "/" 时，
+    用户发的 "/今天好累" 在 event.message_str 里已经是 "今天好累"，
+    在 outline 里却还是 "/今天好累"，被指令守卫误杀；一旦前缀换成
+    "!" 或 "@"，前缀则会连同正文一起写进库里。
+
+    这里按 AstrBot 的规则自己剥一次，保持两边口径一致
+    （参见 astrbot/core/pipeline/waking_check/stage.py:117-137）。
+
+    Args:
+        text: 消息正文，通常是 get_message_outline() 的结果。
+        wake_prefixes: 当前生效的唤醒前缀列表，来自配置项的
+            wake_prefix（默认 ["/"]）。配置被人手改成单个字符串时
+            也接受，这里会自动包成列表。
+
+    Returns:
+        剥掉前缀后的正文；没有命中任何前缀时原样返回。
+    """
+    # 字符串本身也是 Sequence[str]，不单独处理的话会被按字符逐个当前缀。
+    if isinstance(wake_prefixes, str):
+        wake_prefixes = [wake_prefixes]
+    for prefix in wake_prefixes:
+        # 空前缀会让 startswith() 恒为真，必须跳过。
+        if not prefix:
+            continue
+        if text.startswith(prefix):
+            # 与 AstrBot 一致：剥掉前缀后再 strip()，避免留下前导空格。
+            return text[len(prefix) :].strip()
+    return text
+
+
+def should_record_user_text(text: str, *, is_command: bool = False) -> bool:
     """判断一条用户消息是否应当记录。
 
     空文本（纯图片等非文本消息）与指令不记录：指令属于操作行为，
     写进记忆会污染下游的事实提取。
 
+    斜杠判断只是兜底。真正区分指令与聊天的是 is_command：唤醒前缀
+    剥掉之后，"/reset" 和 "/今天好累" 都变成不带斜杠的正文，光看文本
+    已经分不出来，必须由调用方按宿主的事件信息判定。
+
     Args:
-        text: 经过 get_message_outline() 转换后的消息正文。
+        text: 剥掉唤醒前缀后的消息正文。
+        is_command: 这条消息是否命中了某个指令处理器。
 
     Returns:
         True 表示应当记录。
     """
+    if is_command:
+        return False
     return text != "" and not text.startswith(("/", "／"))
 
 
