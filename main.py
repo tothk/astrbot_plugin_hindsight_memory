@@ -6,7 +6,6 @@ from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Plain
 from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
-from .config.config_manager import ConfigManager
 from .config.plugin_paths import PluginPaths
 from .db.models.sql_model_manager import SqlModelManager
 from .core.capture import MessageCapture
@@ -16,12 +15,21 @@ from .core.recorder import Recorder
 # 插件元数据由 metadata.yaml 提供。AstrBot 3.5.19+ 会自动识别继承 Star 的插件类，
 # 已废弃的 @register 装饰器不再使用，避免宿主未来移除它时插件无法加载。
 class MyPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: dict | None = None):
+        """初始化插件。
+
+        Args:
+            context: AstrBot 注入的上下文。
+            config: AstrBot 依据 _conf_schema.json 生成的插件配置。
+                开发期统一以它为唯一数据源；插件自己持有的 config.json
+                暂不使用（后续接 WebUI 时再恢复）。
+        """
         super().__init__(context)
 
+        # 面板里编辑的值最终落在这里；缺省时 Star 基类已给了空 dict。
+        self._config: dict = config or {}
         self.PLUGIN_DATA_PATH = Path(get_astrbot_data_path()) / "plugin_data" / self.name
         self._plugin_paths = PluginPaths(self.PLUGIN_DATA_PATH)
-        self._config_manager = ConfigManager(self._plugin_paths)
         # self.logger 是 AstrBot 为本插件单独准备的 logger（面板里可单独调级别），
         # 比模块级的 astrbot 全局 logger 更适合记录运行期信息。
         self._sql = SqlModelManager(self._plugin_paths, self.logger)
