@@ -9,6 +9,7 @@ from datetime import datetime, time
 import pytest
 
 from astrbot_plugin_hindsight_memory.core.memory_service import (
+    format_sync_result,
     parse_daily_time,
     seconds_until,
 )
@@ -18,7 +19,7 @@ from astrbot_plugin_hindsight_memory.hindsight.plugin_config import (
     DEFAULT_BANK_ID,
     HindsightConfig,
 )
-from astrbot_plugin_hindsight_memory.hindsight.sync import speaker_of
+from astrbot_plugin_hindsight_memory.hindsight.sync import SyncOutcome, speaker_of
 
 
 class TestHindsightConfigFromMapping:
@@ -256,3 +257,38 @@ class TestSpeakerOf:
         )
 
         assert speaker_of(raw) == "10001"
+
+
+class TestFormatSyncResult:
+    def test_success_reports_counts(self):
+        outcome = SyncOutcome(messages=31, batches=4, documents=6, flushed=31)
+
+        text = format_sync_result(outcome)
+
+        assert "31/31" in text
+        assert "4 批" in text
+        assert "6 个文档" in text
+
+    def test_nothing_to_do_has_its_own_message(self):
+        outcome = SyncOutcome(messages=0, batches=0, documents=0, flushed=0)
+
+        assert "没有待提交的记录" in format_sync_result(outcome)
+
+    def test_failure_surfaces_error(self):
+        outcome = SyncOutcome(error="无法连接 Hindsight（http://h:8888）")
+
+        text = format_sync_result(outcome)
+
+        assert text.startswith("❌")
+        assert "无法连接 Hindsight" in text
+
+    def test_partial_flush_is_not_reported_as_success_line(self):
+        # 失败但已经投出去一部分：仍按失败讲述，避免用户误以为全部写完了。
+        outcome = SyncOutcome(
+            messages=31, batches=4, documents=6, flushed=10, error="5xx"
+        )
+
+        text = format_sync_result(outcome)
+
+        assert text.startswith("❌")
+        assert "10/31" not in text

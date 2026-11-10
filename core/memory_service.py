@@ -15,7 +15,7 @@ from datetime import datetime, time, timedelta
 
 from ..hindsight.client import HindsightClient
 from ..hindsight.plugin_config import HindsightConfig
-from ..hindsight.sync import HindsightSync
+from ..hindsight.sync import HindsightSync, SyncOutcome
 from .recall import recall_memories
 
 # 每日补投的默认时刻（配置 sync_daily_time 解析失败时使用）。
@@ -60,6 +60,28 @@ def seconds_until(target: time, now: datetime | None = None) -> float:
     if today_target <= current:
         today_target += timedelta(days=1)
     return (today_target - current).total_seconds()
+
+
+def format_sync_result(outcome: SyncOutcome) -> str:
+    """把一轮同步的结果渲染成给用户看的一句话。
+
+    单独抽成纯函数：手动指令要回复用户，而拼文案这种细节不该混进业务逻辑，
+    也方便直接单测（不需要真的连数据库和 Hindsight）。
+
+    Args:
+        outcome: ``HindsightSync.run()`` 的返回值。
+
+    Returns:
+        一行中文摘要。
+    """
+    if not outcome.ok:
+        return f"❌ 同步失败：{outcome.error}"
+    if outcome.messages == 0:
+        return "✅ 没有待提交的记录，本地记录已经全部同步过了。"
+    return (
+        f"✅ 同步完成：{outcome.flushed}/{outcome.messages} 条记录，"
+        f"{outcome.batches} 批，{outcome.documents} 个文档。"
+    )
 
 
 class MemoryService:
@@ -120,19 +142,28 @@ class MemoryService:
             await asyncio.sleep(max(_MIN_SLEEP, delay))
             await self.sync_once(trigger="每日补投")
 
-    async def sync_once(self, *, trigger: str = "手动") -> None:
-        """执行一轮投递，失败只记日志不抛。"""
+    async def sync_once(self, *, trigger: str = "手动") -> SyncOutcome:
+        """执行一轮投递，失败只记日志不抛。
+
+        Args:
+            trigger: 触发来源，仅用于日志，便于区分定时补投与手动触发。
+
+        Returns:
+            本轮的结果摘要。调用方（例如手动指令）可以据此告诉用户投了多少条；
+            失败时 ``error`` 非空而不抛异常——投递失败不该让指令本身报错。
+        """
         outcome = await self._sync.run()
         if not outcome.ok:
             self._log.warning(f"{trigger}同步中断：{outcome.error}")
-            return
+            return outcome
         if outcome.messages == 0:
             self._log.debug(f"{trigger}：没有待提交的记录")
-            return
+            return outcome
         self._log.info(
             f"{trigger}同步完成：{outcome.flushed}/{outcome.messages} 条，"
             f"{outcome.batches} 批，{outcome.documents} 个文档"
         )
+        return outcome
 
     async def recall_for(self, text: str) -> str:
         """按用户这一轮的消息召回记忆文本。

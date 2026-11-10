@@ -10,7 +10,7 @@ from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from .config.plugin_paths import PluginPaths
 from .db.models.sql_model_manager import SqlModelManager
 from .core.capture import MessageCapture
-from .core.memory_service import MemoryService
+from .core.memory_service import MemoryService, format_sync_result
 from .core.recorder import Recorder
 from .hindsight.plugin_config import HindsightConfig
 
@@ -77,6 +77,22 @@ class MyPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE)
     async def on_private_message(self, event: AstrMessageEvent):
         await self._capture.capture_user(event)
+
+    @filter.command("hindsight_sync")
+    async def hindsight_sync(self, event: AstrMessageEvent):
+        """手动把本地待同步的对话记录投递到 Hindsight。
+
+        定时补投要等到次日 sync_daily_time 才跑第一次，装机当天看不到任何效果，
+        排查时也没有手段立刻验证链路是否通——这条指令就是那个开关。
+
+        Args:
+            event: 触发本条指令的消息事件。
+
+        Yields:
+            一条纯文本结果，告知投递了多少条或失败原因。
+        """
+        outcome = await self._memory.sync_once(trigger="手动指令")
+        yield event.plain_result(format_sync_result(outcome))
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
