@@ -45,7 +45,8 @@ class ListLog:
     """把日志收进列表的假 logger。
 
     core/recorder.py 的 Logger 协议只要求 debug/info/error 三个方法，
-    这里实现同样的形状，用来断言"打了什么级别的日志、内容对不对"。
+    但 hindsight/sync.py 会用 warning 报告「对账查到失败」这类可自愈的
+    异常，所以这里四个方法都给，形状对齐宿主 logger。
     """
 
     def __init__(self) -> None:
@@ -56,6 +57,9 @@ class ListLog:
 
     def info(self, msg: str) -> None:
         self.messages.append(("info", msg))
+
+    def warning(self, msg: str) -> None:
+        self.messages.append(("warning", msg))
 
     def error(self, msg: str) -> None:
         self.messages.append(("error", msg))

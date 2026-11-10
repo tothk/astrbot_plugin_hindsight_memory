@@ -4,16 +4,19 @@
 （用假 store + 假 client，仍然不碰真实服务）。
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import pytest
 
 from astrbot_plugin_hindsight_memory.db.models.models import RawMessage
 from astrbot_plugin_hindsight_memory.hindsight.client import (
     HindsightConnectionError,
+    HindsightOperationNotFoundError,
     RetainResult,
 )
 from astrbot_plugin_hindsight_memory.hindsight.sync import (
+    MAX_ATTEMPTS,
     HindsightSync,
     build_items,
     render_line,
@@ -161,38 +164,91 @@ class TestBuildItems:
 
 @dataclass
 class FakeStore:
-    """只实现同步层需要的两个方法，用来替代 SqlModelManager。"""
+    """只实现同步层需要的几个方法，用来替代 SqlModelManager。
+
+    ``enqueued`` 记下每次入队的 (ids, operation_id)，``resolved`` 记下每次
+    对账结论，``released`` 记下被撤回的批次——断言这些比断言日志更稳。
+    """
 
     pending: list[RawMessage]
     marked: list[int] | None = None
+    enqueued: list[tuple[list[int], str]] | None = None
+    resolved: list[tuple[str, str]] | None = None
+    released: list[str] | None = None
+    operations: list = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.marked = []
+        self.enqueued = []
+        self.resolved = []
+        self.released = []
 
     def list_unflushed(self, limit: int) -> list[RawMessage]:
         return self.pending[:limit]
 
-    def mark_flushed(self, ids) -> int:
+    def mark_flushed(self, ids, value: int = 2) -> int:
         self.marked.extend(ids)
         return len(ids)
 
+    def mark_enqueued(self, ids, *, operation_id: str, items_count: int = 0) -> int:
+        id_list = list(ids)
+        self.enqueued.append((id_list, operation_id))
+        return len(id_list)
+
+    def pending_operations(self, limit: int = 100) -> list:
+        return self.operations[:limit]
+
+    def resolve_operation(
+        self, operation_id: str, *, status: str, error: str = "", attempts=None
+    ) -> int:
+        self.resolved.append((operation_id, status))
+        return 1
+
+    def release_operation(self, operation_id: str) -> int:
+        self.released.append(operation_id)
+        return 1
+
+
+def make_operation(operation_id: str, *, attempts: int = 0):
+    """造一条本地记下的批次凭据。"""
+    return SimpleNamespace(operation_id=operation_id, attempts=attempts)
+
 
 class FakeClient:
-    """记录每次 retain 调用的假客户端。"""
+    """记录每次调用的假客户端。"""
 
-    def __init__(self, *, success: bool = True, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        success: bool = True,
+        error: Exception | None = None,
+        operation_id: str = "op-1",
+        statuses: dict[str, dict] | None = None,
+        retry_error: Exception | None = None,
+    ) -> None:
         self.success = success
         self.error = error
+        self.operation_id = operation_id
+        self.statuses = statuses or {}
+        self.retry_error = retry_error
         self.calls: list[tuple[str, list[dict]]] = []
-        # 记录每次调用用的是同步还是异步模式：这层必须钉住同步语义，
-        # 异步改造之前若被悄悄改成 True，200 就只代表「已排队」。
+        # 记录每次调用用的同步/异步模式与自带的 operation_id。
         self.async_modes: list[bool] = []
+        self.operation_ids: list[str | None] = []
+        self.retried: list[str] = []
 
     async def retain(
-        self, bank_id: str, items: list[dict], *, is_async: bool = True, **_: object
+        self,
+        bank_id: str,
+        items: list[dict],
+        *,
+        is_async: bool = True,
+        operation_id: str | None = None,
+        **_: object,
     ) -> RetainResult:
         self.calls.append((bank_id, items))
         self.async_modes.append(is_async)
+        self.operation_ids.append(operation_id)
         if self.error is not None:
             raise self.error
         return RetainResult(
@@ -201,7 +257,17 @@ class FakeClient:
             items_count=len(items),
             is_async=is_async,
             usage={},
+            operation_id=self.operation_id,
         )
+
+    async def get_operation(self, bank_id: str, operation_id: str) -> dict:
+        return self.statuses.get(operation_id, {"status": "pending"})
+
+    async def retry_operation(self, bank_id: str, operation_id: str) -> dict:
+        if self.retry_error is not None:
+            raise self.retry_error
+        self.retried.append(operation_id)
+        return {"success": True}
 
 
 class TestHindsightSyncRun:
@@ -216,21 +282,41 @@ class TestHindsightSyncRun:
         assert outcome.ok is True
         assert outcome.messages == 0
         assert client.calls == []
-        assert store.marked == []
+        assert store.enqueued == []
 
-    async def test_success_marks_flushed(self, log) -> None:
+    async def test_success_enqueues_with_operation_id(self, log) -> None:
         store = FakeStore([make_raw(id=1), make_raw(id=2, text="第二条")])
-        client = FakeClient()
+        client = FakeClient(operation_id="op-abc")
         outcome = await HindsightSync(
             store, client, bank_id="dev", max_chars=10_000, log=log
         ).run()
         assert outcome.ok is True
         assert outcome.flushed == 2
-        assert store.marked == [1, 2]
+        assert store.enqueued == [([1, 2], "op-abc")]
         assert len(client.calls) == 1
         assert client.calls[0][0] == "dev"
 
-    async def test_error_does_not_mark_flushed(self, log) -> None:
+    async def test_submits_asynchronously(self, log) -> None:
+        """异步提交是这一层的核心：同步一次要 80 秒以上。"""
+        store = FakeStore([make_raw(id=1)])
+        client = FakeClient()
+        await HindsightSync(
+            store, client, bank_id="dev", max_chars=10_000, log=log
+        ).run()
+        assert client.async_modes == [True]
+
+    async def test_sends_locally_generated_operation_id(self, log) -> None:
+        """operation_id 由本地生成，才能在超时后用同一个 id 安全重发。"""
+        store = FakeStore([make_raw(id=1)])
+        client = FakeClient()
+        await HindsightSync(
+            store, client, bank_id="dev", max_chars=10_000, log=log
+        ).run()
+        sent = client.operation_ids[0]
+        assert sent is not None
+        assert len(sent) == 36  # uuid4 的字符串形式
+
+    async def test_error_does_not_enqueue(self, log) -> None:
         """提交失败不能标记，否则这批内容就永远丢了。"""
         store = FakeStore([make_raw(id=1)])
         client = FakeClient(error=HindsightConnectionError("连不上"))
@@ -239,7 +325,7 @@ class TestHindsightSyncRun:
         ).run()
         assert outcome.ok is False
         assert outcome.flushed == 0
-        assert store.marked == []
+        assert store.enqueued == []
         assert log.text_of("error")
 
     async def test_success_false_is_treated_as_failure(self, log) -> None:
@@ -250,7 +336,7 @@ class TestHindsightSyncRun:
             store, client, bank_id="dev", max_chars=10_000, log=log
         ).run()
         assert outcome.ok is False
-        assert store.marked == []
+        assert store.enqueued == []
 
     async def test_stops_at_first_failing_batch(self, log) -> None:
         """首批失败后不再尝试后续批次，避免把错误日志刷满。"""
@@ -262,10 +348,10 @@ class TestHindsightSyncRun:
         ).run()
         assert outcome.ok is False
         assert len(client.calls) == 1
-        assert store.marked == []
+        assert store.enqueued == []
 
-    async def test_multiple_batches_all_marked(self, log) -> None:
-        """多批全部成功时，每批各自标记。"""
+    async def test_multiple_batches_all_enqueued(self, log) -> None:
+        """多批全部成功时，每批各自入队。"""
         messages = [make_raw(id=i, text="x" * 100) for i in range(5)]
         store = FakeStore(messages)
         client = FakeClient()
@@ -274,5 +360,150 @@ class TestHindsightSyncRun:
         ).run()
         assert outcome.ok is True
         assert len(client.calls) > 1
-        assert store.marked == [0, 1, 2, 3, 4]
+        assert len(store.enqueued) == len(client.calls)
         assert outcome.flushed == 5
+
+    async def test_missing_operation_id_falls_back_to_done(self, log) -> None:
+        """服务端没回 operation_id 时无从对账，只能按已提交处理。
+
+        留在待投递会被重复追加，比误判完成更糟。
+        """
+        store = FakeStore([make_raw(id=1)])
+        client = FakeClient(operation_id="")
+        outcome = await HindsightSync(
+            store, client, bank_id="dev", max_chars=10_000, log=log
+        ).run()
+        assert store.enqueued == []
+        assert store.marked == [1]
+        assert outcome.flushed == 1
+
+
+class TestReconcile:
+    """先对账、后投递。"""
+
+    async def test_completed_marks_rows_done(self, log) -> None:
+        store = FakeStore([])
+        store.operations = [make_operation("op-1")]
+        client = FakeClient(statuses={"op-1": {"status": "completed"}})
+        outcome = await HindsightSync(
+            store, client, bank_id="dev", max_chars=10_000, log=log
+        ).run()
+        assert store.resolved == [("op-1", "completed")]
+        assert outcome.completed == 1
+        assert client.calls == []
+
+    async def test_pending_left_alone(self, log) -> None:
+        """还在处理中的批次不能动，否则会把正在跑的操作当成失败。"""
+        store = FakeStore([])
+        store.operations = [make_operation("op-1")]
+        client = FakeClient(statuses={"op-1": {"status": "processing"}})
+        outcome = await HindsightSync(
+            store, client, bank_id="dev", max_chars=10_000, log=log
+        ).run()
+        assert store.resolved == []
+        assert outcome.completed == 0
+        assert outcome.retried == 0
+
+    async def test_failed_is_retried_not_resubmitted(self, log) -> None:
+        """失败先调 retry：重投会在文档末尾再追加一遍。"""
+        store = FakeStore([])
+        store.operations = [make_operation("op-1", attempts=0)]
+        client = FakeClient(statuses={"op-1": {"status": "failed", "error_message": "boom"}})
+        outcome = await HindsightSync(
+            store, client, bank_id="dev", max_chars=10_000, log=log
+        ).run()
+        assert client.retried == ["op-1"]
+        # 重试后变回 pending，等下一轮再看
+        assert store.resolved == [("op-1", "pending")]
+        assert outcome.retried == 1
+        # 全程没有重投内容
+        assert client.calls == []
+
+    async def test_failed_after_max_attempts_is_released(self, log) -> None:
+        """屡试不成才放弃，把记录退回待投递。"""
+        store = FakeStore([])
+        store.operations = [make_operation("op-1", attempts=MAX_ATTEMPTS - 1)]
+        client = FakeClient(statuses={"op-1": {"status": "failed"}})
+        outcome = await HindsightSync(
+            store, client, bank_id="dev", max_chars=10_000, log=log
+        ).run()
+        assert store.released == ["op-1"]
+        assert outcome.released == 1
+        assert client.retried == []
+
+    async def test_missing_operation_is_released(self, log) -> None:
+        """服务端已经没有这个操作了，retry 也无从谈起。"""
+        store = FakeStore([])
+        store.operations = [make_operation("op-gone")]
+        client = FakeClient()
+        client.get_operation = _raise_operation_missing  # type: ignore[method-assign]
+        outcome = await HindsightSync(
+            store, client, bank_id="dev", max_chars=10_000, log=log
+        ).run()
+        assert store.released == ["op-gone"]
+        assert outcome.released == 1
+
+    async def test_retry_error_keeps_batch_failed(self, log) -> None:
+        """连 retry 请求都发不出去时，保持 failed 等下一轮。"""
+        store = FakeStore([])
+        store.operations = [make_operation("op-1")]
+        client = FakeClient(
+            statuses={"op-1": {"status": "failed"}},
+            retry_error=HindsightConnectionError("连不上"),
+        )
+        outcome = await HindsightSync(
+            store, client, bank_id="dev", max_chars=10_000, log=log
+        ).run()
+        assert store.resolved == [("op-1", "failed")]
+        assert outcome.retried == 0
+        assert outcome.released == 0
+
+    async def test_query_error_skips_that_batch(self, log) -> None:
+        """单个批次查不到不影响别的批次。"""
+        store = FakeStore([])
+        store.operations = [make_operation("op-1"), make_operation("op-2")]
+        client = FakeClient(statuses={"op-2": {"status": "completed"}})
+
+        async def flaky(bank_id: str, operation_id: str) -> dict:
+            if operation_id == "op-1":
+                raise HindsightConnectionError("超时")
+            return {"status": "completed"}
+
+        client.get_operation = flaky  # type: ignore[method-assign]
+        outcome = await HindsightSync(
+            store, client, bank_id="dev", max_chars=10_000, log=log
+        ).run()
+        assert store.resolved == [("op-2", "completed")]
+        assert outcome.completed == 1
+
+    async def test_reconcile_runs_before_submit(self, log) -> None:
+        """顺序不能反：先确认上一轮，再把新记录排进去。"""
+        order: list[str] = []
+        store = FakeStore([make_raw(id=1)])
+        store.operations = [make_operation("op-1")]
+        client = FakeClient(statuses={"op-1": {"status": "completed"}})
+
+        original_get = client.get_operation
+
+        async def tracked_get(bank_id: str, operation_id: str) -> dict:
+            order.append("get")
+            return await original_get(bank_id, operation_id)
+
+        original_retain = client.retain
+
+        async def tracked_retain(bank_id, items, **kwargs):
+            order.append("retain")
+            return await original_retain(bank_id, items, **kwargs)
+
+        client.get_operation = tracked_get  # type: ignore[method-assign]
+        client.retain = tracked_retain  # type: ignore[method-assign]
+
+        await HindsightSync(
+            store, client, bank_id="dev", max_chars=10_000, log=log
+        ).run()
+        assert order == ["get", "retain"]
+
+
+async def _raise_operation_missing(bank_id: str, operation_id: str) -> dict:
+    raise HindsightOperationNotFoundError("操作不存在")
+
