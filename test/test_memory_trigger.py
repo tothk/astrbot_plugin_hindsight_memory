@@ -121,3 +121,120 @@ class TestNoteSaved:
         await service.stop()  # 不应抛 CancelledError
 
         assert service._sync_task is None
+
+
+class ConcurrencyProbe:
+    """记录每次 run() 的进出，用来判断两轮是否重叠。"""
+
+    def __init__(self) -> None:
+        self.events: list[tuple[str, int]] = []
+        self.running = 0
+        self.overlapped = False
+
+    async def run(self) -> SyncOutcome:
+        index = len([e for e in self.events if e[0] == "enter"])
+        self.events.append(("enter", index))
+        self.running += 1
+        if self.running > 1:
+            self.overlapped = True
+        # 让出两次事件循环：如果两轮能交错，这里必然被插进来。
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.running -= 1
+        self.events.append(("exit", index))
+        return SyncOutcome(messages=1, batches=1, documents=1, flushed=1)
+
+
+class TestSyncMutualExclusion:
+    """三路触发必须串行，否则会各读一份快照、把同一段内容投两遍。
+
+    后台触发那条路原本由 ``_sync_task`` 挡住，但每日补投与手动指令都直接
+    调 ``sync_once()``，挡不住。互斥因此下沉到 ``sync_once()`` 本身。
+    """
+
+    async def test_concurrent_calls_do_not_overlap(self, log):
+        service, _sync = make_service(log)
+        probe = ConcurrencyProbe()
+        service._sync = probe
+
+        await asyncio.gather(
+            service.sync_once(trigger="手动指令"),
+            service.sync_once(trigger="每日补投"),
+        )
+
+        assert probe.overlapped is False
+        # 严丝合缝：先进先出，没有交叉。
+        assert probe.events == [("enter", 0), ("exit", 0), ("enter", 1), ("exit", 1)]
+
+    async def test_both_callers_still_get_their_own_result(self, log):
+        # 串行不等于吞掉一次调用：两个调用方都要拿到结果，
+        # 否则手动指令会一直等不到回复。
+        service, _sync = make_service(log)
+        service._sync = ConcurrencyProbe()
+
+        first, second = await asyncio.gather(
+            service.sync_once(trigger="手动指令"),
+            service.sync_once(trigger="每日补投"),
+        )
+
+        assert first.flushed == 1
+        assert second.flushed == 1
+
+    async def test_manual_call_waits_for_background_sync(self, log):
+        # 最容易踩的组合：后台正投着，用户又发了 /hindsight_sync。
+        service, _sync = make_service(log, batch_chars=1)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        probe = ConcurrencyProbe()
+
+        class BlockingFirstSync:
+            """只挡第一次调用；后续调用直接走完。
+
+            这样若没有互斥锁，手动那轮会立刻跑完、并和仍在等待的首轮
+            重叠——「manual.done() 仍为 False」就是锁生效的证据。
+            """
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def run(self):
+                self.calls += 1
+                if self.calls == 1:
+                    entered.set()
+                    await release.wait()
+                return await probe.run()
+
+        service._sync = BlockingFirstSync()
+        service.note_saved(1)
+        await entered.wait()
+
+        manual = asyncio.create_task(service.sync_once(trigger="手动指令"))
+        # 手动那轮必须还在等锁，不能已经开始跑。
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert probe.events == []
+        assert not manual.done()
+
+        release.set()
+        await manual
+        await service._sync_task
+
+        assert probe.overlapped is False
+        assert probe.events == [("enter", 0), ("exit", 0), ("enter", 1), ("exit", 1)]
+
+    async def test_lock_is_released_when_a_round_fails(self, log):
+        # 失败如果没有释放锁，之后所有触发都会永久卡死。
+        service, _sync = make_service(log)
+
+        class BoomSync:
+            async def run(self):
+                raise RuntimeError("database is locked")
+
+        service._sync = BoomSync()
+        outcome = await service.sync_once(trigger="手动指令")
+        assert outcome.ok is False
+
+        service._sync = FakeSync()
+        retry = await service.sync_once(trigger="手动指令")
+        assert retry.ok is True
+        assert retry.flushed == 2

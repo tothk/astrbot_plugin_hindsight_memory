@@ -117,6 +117,13 @@ class MemoryService:
         self._pending_chars = 0
         # 后台投递任务：同一时刻只允许一个，否则连发几条消息会并发抢同一批记录。
         self._sync_task: asyncio.Task | None = None
+        # 三路触发（积压/每日/手动）共用的互斥锁。见 start() 的说明。
+        #
+        # 注意它必须守的临界区是「读出待投递记录 → 提交 → 标记已入队」，而不是
+        # 某一个触发源的入口：只要两个 sync_once() 交错跑进 submit()，双方都会
+        # 读到同一批 flushed=0 的行，各自生成不同的 operation_id 交上去，
+        # 同一段对话就在文档末尾被 append 了两遍。只挡后台任务挡不住另外两路。
+        self._sync_lock = asyncio.Lock()
 
     async def start(self) -> None:
         """启动每日补投任务。"""
@@ -243,12 +250,29 @@ class MemoryService:
         每日循环被穿透就停摆，手动指令会让 AstrBot 回一句「插件出现异常」，
         积压触发则是无人 await 的后台任务。所以这里把异常也收成结果对象。
 
+        三路触发共用同一把锁：整轮（对账 + 投递 + 标记）必须串行。串在
+        ``sync_once()`` 这一层而不是各触发源的入口，是因为要排除的不只是
+        「两个后台任务同时跑」，而是任意两轮的交错——每日补投撞上手动指令
+        同样会各自读出一份 ``flushed=0`` 的快照。
+
         Args:
             trigger: 触发来源，仅用于日志，便于区分定时补投与手动触发。
 
         Returns:
             本轮的结果摘要。调用方（例如手动指令）可以据此告诉用户投了多少条；
             失败时 ``error`` 非空而不抛异常——投递失败不该让指令本身报错。
+        """
+        async with self._sync_lock:
+            return await self._sync_once_locked(trigger=trigger)
+
+    async def _sync_once_locked(self, *, trigger: str) -> SyncOutcome:
+        """``sync_once()`` 的实体，调用前必须已持有 ``_sync_lock``。
+
+        Args:
+            trigger: 触发来源，仅用于日志。
+
+        Returns:
+            本轮的结果摘要。
         """
         try:
             outcome = await self._sync.run()
