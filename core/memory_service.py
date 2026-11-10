@@ -302,7 +302,7 @@ class MemoryService:
             text: 用户消息正文。
 
         Returns:
-            可注入系统提示的文本；没有记忆时为空串。
+            可注入本轮用户消息的文本；没有记忆时为空串。
         """
         return await recall_memories(
             self._client,

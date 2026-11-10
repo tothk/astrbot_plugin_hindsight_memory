@@ -22,9 +22,11 @@ _PREFERRED_TYPE = "observation"
 # 也不能让用户等待。Hindsight 冷启动首次检索可能要几秒。
 _DEFAULT_TIMEOUT = 3.0
 
-# 注入到系统提示里的标题。用纯文本而不是 JSON，是为了让模型读起来像背景信息
+# 注入到用户消息里的标题。用纯文本而不是 JSON，是为了让模型读起来像背景信息
 # 而不是结构化数据——后者容易被它当成待处理的任务。
-_HEADER = "以下是你对该用户既往对话的记忆片段，仅供参考，不要逐条复述："
+# 这段文字最终出现在**用户消息**里（见 main.py 的 on_llm_request），所以用
+# 「【相关记忆】」这种块标记把边界标清楚，避免模型把记忆内容当成用户刚说的话。
+_HEADER = "【相关记忆】以下是你们过往对话中与当前话题相关的片段，仅供参考，不要逐条复述："
 
 
 def format_memories(results: list[dict], limit: int) -> str:
@@ -35,7 +37,7 @@ def format_memories(results: list[dict], limit: int) -> str:
         limit: 最多保留几条，对应配置项 ``recall_memory_quantity``。
 
     Returns:
-        可直接追加到系统提示的文本；没有可用记忆时返回空串。
+        可直接注入到用户消息里的文本；没有可用记忆时返回空串。
     """
     if limit <= 0:
         return ""
@@ -117,7 +119,7 @@ async def recall_memories(
         timeout: 整体超时秒数。
 
     Returns:
-        可注入系统提示的文本；没有记忆或出错时返回空串。
+        可注入用户消息的文本；没有记忆或出错时返回空串。
     """
     query = query.strip()
     if not query or quantity <= 0:
