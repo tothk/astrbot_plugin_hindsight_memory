@@ -332,15 +332,43 @@ class TestHindsightSyncRun:
 
     async def test_success_enqueues_with_operation_id(self, log) -> None:
         store = FakeStore([make_raw(id=1), make_raw(id=2, text="第二条")])
-        client = FakeClient(operation_id="op-abc")
+        client = FakeClient()
         outcome = await HindsightSync(
             store, client, bank_id="dev", max_chars=10_000, log=log
         ).run()
         assert outcome.ok is True
         assert outcome.flushed == 2
-        assert store.enqueued == [([1, 2], "op-abc")]
+        assert len(store.enqueued) == 1
+        ids, enqueued_id = store.enqueued[0]
+        assert ids == [1, 2]
+        # 关键：本地记下的就是这个 id，发出去的也是这个 id。两者必须相等，
+        # 否则崩溃后对账会查一个服务端从没见过的 id。
+        assert enqueued_id == client.operation_ids[0]
         assert len(client.calls) == 1
         assert client.calls[0][0] == "dev"
+
+    async def test_enqueues_before_sending(self, log) -> None:
+        """凭据必须在请求之前落库：这是崩在中间的整条防线。"""
+        order: list[str] = []
+
+        class OrderedStore(FakeStore):
+            def mark_enqueued(self, ids, *, operation_id, items_count=0):
+                order.append("enqueue")
+                return super().mark_enqueued(
+                    ids, operation_id=operation_id, items_count=items_count
+                )
+
+        class OrderedClient(FakeClient):
+            async def retain(self, *args, **kwargs):
+                order.append("retain")
+                return await super().retain(*args, **kwargs)
+
+        store = OrderedStore([make_raw(id=1)])
+        await HindsightSync(
+            store, OrderedClient(), bank_id="dev", max_chars=10_000, log=log
+        ).run()
+
+        assert order == ["enqueue", "retain"]
 
     async def test_submits_asynchronously(self, log) -> None:
         """异步提交是这一层的核心：同步一次要 80 秒以上。"""
@@ -362,8 +390,11 @@ class TestHindsightSyncRun:
         assert sent is not None
         assert len(sent) == 36  # uuid4 的字符串形式
 
-    async def test_error_does_not_enqueue(self, log) -> None:
-        """提交失败不能标记，否则这批内容就永远丢了。"""
+    async def test_error_keeps_rows_enqueued_for_reconcile(self, log) -> None:
+        """提交失败不能退回待投递：服务端可能其实收到了。
+
+        留在「已入队」，下一轮对账查同一个 id：404 说明确实没到，才退回重投。
+        """
         store = FakeStore([make_raw(id=1)])
         client = FakeClient(error=HindsightConnectionError("连不上"))
         outcome = await HindsightSync(
@@ -371,18 +402,22 @@ class TestHindsightSyncRun:
         ).run()
         assert outcome.ok is False
         assert outcome.flushed == 0
-        assert store.enqueued == []
+        # 凭据已经落库（请求发出之前就写好了）
+        assert len(store.enqueued) == 1
+        # 但没有被退回待投递
+        assert store.released == []
         assert log.text_of("error")
 
-    async def test_success_false_is_treated_as_failure(self, log) -> None:
-        """服务端回 200 但 success=false，同样不能标记。"""
+    async def test_success_false_keeps_rows_enqueued(self, log) -> None:
+        """服务端回 200 但 success=false：同样留给对账判断。"""
         store = FakeStore([make_raw(id=1)])
         client = FakeClient(success=False)
         outcome = await HindsightSync(
             store, client, bank_id="dev", max_chars=10_000, log=log
         ).run()
         assert outcome.ok is False
-        assert store.enqueued == []
+        assert len(store.enqueued) == 1
+        assert store.released == []
 
     async def test_stops_at_first_failing_batch(self, log) -> None:
         """首批失败后不再尝试后续批次，避免把错误日志刷满。"""
@@ -394,7 +429,8 @@ class TestHindsightSyncRun:
         ).run()
         assert outcome.ok is False
         assert len(client.calls) == 1
-        assert store.enqueued == []
+        # 只有首批拿到了凭据，后面的批次连 mark_enqueued 都不会走到
+        assert len(store.enqueued) == 1
 
     async def test_multiple_batches_all_enqueued(self, log) -> None:
         """多批全部成功时，每批各自入队。"""
@@ -409,19 +445,24 @@ class TestHindsightSyncRun:
         assert len(store.enqueued) == len(client.calls)
         assert outcome.flushed == 5
 
-    async def test_missing_operation_id_falls_back_to_done(self, log) -> None:
-        """服务端没回 operation_id 时无从对账，只能按已提交处理。
+    async def test_missing_operation_id_in_response_keeps_local_id(self, log) -> None:
+        """服务端没回 operation_id 时继续用本地那个。
 
-        留在待投递会被重复追加，比误判完成更糟。
+        本地这个 id 是我们发请求时给出的，对账查它就知道到底收没收到；
+        丢它换成「按已提交处理」反而断了对账线索。
         """
         store = FakeStore([make_raw(id=1)])
         client = FakeClient(operation_id="")
         outcome = await HindsightSync(
             store, client, bank_id="dev", max_chars=10_000, log=log
         ).run()
-        assert store.enqueued == []
-        assert store.marked == [1]
         assert outcome.flushed == 1
+        ids, enqueued_id = store.enqueued[0]
+        assert ids == [1]
+        assert enqueued_id == client.operation_ids[0]
+        # 没有走「按已提交处理」那条老路
+        assert store.marked == []
+        assert any("继续使用本地 id" in msg for msg in log.text_of("warning"))
 
 
 class TestReconcile:

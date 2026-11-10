@@ -91,10 +91,9 @@ class TestStoreFailuresBecomeOutcome:
         assert outcome.ok is False
         assert "database is locked" in (outcome.error or "")
 
-    async def test_mark_enqueued_failure_is_reported(self, log):
-        # 场景：服务端已经收下了这批内容，本地却记不下 operation_id。
-        # 下一轮会把它们当没投递再交一次，文档末尾因此多一份。这个代价
-        # 无法在本轮挽回，但绝不能安静地当成成功。
+    async def test_mark_enqueued_failure_aborts_before_sending(self, log):
+        # 凭据没落库就不该发请求：记录还停在待投递，服务端什么都不知道，
+        # 下一轮正常重投即可，不会产生第二份内容。
         class BrokenStore(BaseStore):
             def list_unflushed(self, limit: int = 1000):
                 return [make_raw(1)]
@@ -102,34 +101,90 @@ class TestStoreFailuresBecomeOutcome:
             def mark_enqueued(self, ids, *, operation_id, items_count=0):
                 raise RuntimeError("disk full")
 
-        class QueueClient:
+        calls = []
+
+        class CountingClient:
             async def retain(self, bank_id, items, **kwargs):
+                calls.append(kwargs.get("operation_id"))
                 return SimpleNamespace(success=True, operation_id="op-1")
 
-        outcome = await make_sync(BrokenStore(), QueueClient(), log=log).run()
+        outcome = await make_sync(BrokenStore(), CountingClient(), log=log).run()
 
         assert outcome.ok is False
         assert "disk full" in (outcome.error or "")
         assert outcome.flushed == 0
+        # 关键断言：请求根本没发出去
+        assert calls == []
 
-    async def test_mark_flushed_failure_is_reported(self, log):
-        # 服务端没回 operation_id 时的分支：这批只能按已提交处理，
-        # 而「标记已提交」本身也可能失败。
-        class BrokenStore(BaseStore):
+    async def test_retain_failure_keeps_rows_enqueued(self, log):
+        # 提交失败时不能把记录退回待投递：服务端可能其实收到了，退回会让它
+        # 被再投一次。留在「已入队」，下一轮对账查这个 id 就能分清。
+        class RecordingStore(BaseStore):
+            def __init__(self):
+                self.enqueued = []
+                self.released = []
+
             def list_unflushed(self, limit: int = 1000):
                 return [make_raw(1)]
 
+            def mark_enqueued(self, ids, *, operation_id, items_count=0):
+                self.enqueued.append((list(ids), operation_id))
+                return 1
+
+            def release_operation(self, operation_id):
+                self.released.append(operation_id)
+                return 1
+
+        class DeadClient:
+            async def retain(self, bank_id, items, **kwargs):
+                from astrbot_plugin_hindsight_memory.hindsight.client import (
+                    HindsightConnectionError,
+                )
+
+                raise HindsightConnectionError("连接超时")
+
+        store = RecordingStore()
+        outcome = await make_sync(store, DeadClient(), log=log).run()
+
+        assert outcome.ok is False
+        assert outcome.flushed == 0
+        # 凭据在发请求之前就落库了
+        assert len(store.enqueued) == 1
+        # 而且没有把它退回待投递
+        assert store.released == []
+
+    async def test_missing_operation_id_in_response_still_uses_local_id(self, log):
+        # 服务端没回 operation_id 时不该丢掉本地这个 id：它是我们对账的唯一
+        # 线索，而且请求是我们发的、id 也是我们给的。
+        class RecordingStore(BaseStore):
+            def __init__(self):
+                self.enqueued = []
+                self.flushed_marks = []
+
+            def list_unflushed(self, limit: int = 1000):
+                return [make_raw(1)]
+
+            def mark_enqueued(self, ids, *, operation_id, items_count=0):
+                self.enqueued.append(operation_id)
+                return 1
+
             def mark_flushed(self, ids, value: int = 2):
-                raise RuntimeError("disk full")
+                self.flushed_marks.append((list(ids), value))
+                return 1
 
         class NoIdClient:
             async def retain(self, bank_id, items, **kwargs):
                 return SimpleNamespace(success=True, operation_id="")
 
-        outcome = await make_sync(BrokenStore(), NoIdClient(), log=log).run()
+        store = RecordingStore()
+        outcome = await make_sync(store, NoIdClient(), log=log).run()
 
-        assert outcome.ok is False
-        assert "disk full" in (outcome.error or "")
+        assert outcome.ok is True
+        assert outcome.flushed == 1
+        # 凭据仍然只有提交前那一个，没有被「按已提交处理」覆盖掉
+        assert len(store.enqueued) == 1
+        assert store.flushed_marks == []
+        assert any("继续使用本地 id" in msg for msg in log.text_of("warning"))
 
     async def test_reconcile_resolve_failure_does_not_stop_other_batches(self, log):
         # 一个批次写不进去，别的批次仍该对账完成——否则每次都要从头再来。

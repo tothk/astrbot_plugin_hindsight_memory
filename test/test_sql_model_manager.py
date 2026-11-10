@@ -10,6 +10,7 @@ from astrbot_plugin_hindsight_memory.db.models.models import (
     FLUSHED_PENDING,
     RawMessage,
 )
+from astrbot_plugin_hindsight_memory.hindsight.client import RetainResult
 
 
 def make_raw(*, text: str = "今天有点累", flushed: int = FLUSHED_PENDING) -> RawMessage:
@@ -198,3 +199,65 @@ class TestRoundTripWithSync:
         assert len(pending) == 2
         sql.mark_flushed([row.id for row in pending])
         assert sql.list_unflushed() == []
+
+
+class TestCrashRecovery:
+    """崩在「凭据已落库、请求没到」的那个窗口里，下一轮能自愈。"""
+
+    async def test_lost_submission_is_released_then_retried(self, sql, log) -> None:
+        from sqlmodel import Session, select
+
+        from astrbot_plugin_hindsight_memory.db.models.models import SyncOperation
+        from astrbot_plugin_hindsight_memory.hindsight.client import (
+            HindsightConnectionError,
+            HindsightOperationNotFoundError,
+        )
+        from astrbot_plugin_hindsight_memory.hindsight.sync import HindsightSync
+        class FlakyClient:
+            """第一次提交「丢包」，之后恢复正常。"""
+
+            def __init__(self) -> None:
+                self.operation_ids: list[str] = []
+                self.submitted: set[str] = set()
+
+            async def retain(self, bank_id, items, *, is_async=True, operation_id=None, **_):
+                self.operation_ids.append(operation_id)
+                if len(self.operation_ids) == 1:
+                    # 请求发出后进程就没了：服务端从没收到过这个 id
+                    raise HindsightConnectionError("进程被卸载")
+                self.submitted.add(operation_id)
+                return RetainResult(
+                    success=True, bank_id=bank_id, items_count=len(items),
+                    is_async=is_async, usage={}, operation_id=operation_id,
+                )
+
+            async def get_operation(self, bank_id, operation_id):
+                if operation_id in self.submitted:
+                    return {"status": "completed"}
+                raise HindsightOperationNotFoundError("查无此操作")
+
+            async def retry_operation(self, bank_id, operation_id):
+                raise AssertionError("操作不存在，retry 无从谈起")
+
+        sql.insert_raw(make_raw(text="崩前的记录"))
+        client = FlakyClient()
+        sync = HindsightSync(sql, client, bank_id="dev", max_chars=10_000, log=log)
+
+        first = await sync.run()
+        assert first.ok is False
+        assert first.flushed == 0
+        # 凭据已落库、记录停在「已入队」——这正是需要自愈的状态
+        assert sql.count_by_flushed() == {FLUSHED_ENQUEUED: 1}
+        lost_id = client.operation_ids[0]
+
+        # 下一轮：对账查无此 id → 退回待投递 → 用新 id 重投成功
+        second = await sync.run()
+        assert second.released == 1
+        assert sql.count_by_flushed() == {FLUSHED_ENQUEUED: 1}
+        # 重投用的是新 id，旧 id 不会被复用
+        assert client.operation_ids[1] != lost_id
+        assert len(client.operation_ids) == 2
+        # 旧凭据记录已被清掉，只剩新的一条
+        with Session(sql._engine) as session:
+            records = session.exec(select(SyncOperation)).all()
+        assert [r.operation_id for r in records] == [client.operation_ids[1]]
