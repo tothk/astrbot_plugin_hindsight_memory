@@ -1,6 +1,11 @@
-from sqlalchemy import Engine, event
+from typing import Sequence
+
+from sqlalchemy import Engine, event, update
 from sqlalchemy.exc import IntegrityError
-from sqlmodel import Session, SQLModel, create_engine
+# select 必须用 sqlmodel 的：它返回 SelectOfScalar，Session.exec 才会自动
+# 调 .scalars() 取出模型对象。用 sqlalchemy.select 的话 exec 返回的是 Row，
+# 访问 row.raw_message 会报 AttributeError。
+from sqlmodel import Session, SQLModel, create_engine, select
 from ...config.plugin_paths import PluginPaths
 from .models import RawMessage
 from .p_base_model import PBaseModel
@@ -64,6 +69,49 @@ class SqlModelManager:
         except IntegrityError:
             # 唯一索引冲突：这条内容此前已经记录过，视为成功。
             return None
+
+    def list_unflushed(self, limit: int = 1000) -> list[RawMessage]:
+        """按 id 升序取出尚未提交给 Hindsight 的记录。
+
+        用 id 作为游标而不是时间：id 严格递增且不受系统时钟回拨影响，
+        「上次同步到哪」可以直接由「最后一条 flushed=1 的 id」推出。
+
+        Args:
+            limit: 最多取多少条，防止积压过多时一次性读进内存。
+
+        Returns:
+            尚未提交的记录列表，按 id 升序；没有则返回空列表。
+        """
+        statement = (
+            select(RawMessage)
+            .where(RawMessage.flushed == 0)
+            .order_by(RawMessage.id)
+            .limit(limit)
+        )
+        with Session(self._engine) as session:
+            return list(session.exec(statement))
+
+    def mark_flushed(self, ids: Sequence[int]) -> int:
+        """把给定记录标记为已提交。
+
+        Args:
+            ids: 记录主键列表；空列表会直接返回 0，不执行 SQL。
+
+        Returns:
+            实际更新的行数。
+        """
+        if not ids:
+            return 0
+        statement = (
+            update(RawMessage)
+            .where(RawMessage.id.in_(list(ids)))
+            .values(flushed=1)
+        )
+        with Session(self._engine) as session:
+            # 用 execute 而不是 exec：exec 只接受 select，Update 语句会报类型错误。
+            result = session.execute(statement)
+            session.commit()
+            return result.rowcount or 0
 
     def close(self) -> None:
         """关闭连接池，触发 WAL checkpoint。"""
