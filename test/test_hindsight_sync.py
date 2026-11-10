@@ -19,6 +19,7 @@ from astrbot_plugin_hindsight_memory.hindsight.sync import (
     MAX_ATTEMPTS,
     HindsightSync,
     build_items,
+    document_timestamp,
     render_line,
     split_batches,
 )
@@ -37,11 +38,19 @@ def make_raw(
     document_id: str = "2026-11-10:aiocqhttp:FriendMessage:10001",
     sent_time: str = T1,
     flushed: int = 0,
+    record_date: str | None = None,
 ) -> RawMessage:
-    """造一条记录，只覆盖测试关心的字段。"""
+    """造一条记录，只覆盖测试关心的字段。
+
+    ``record_date`` 默认从 ``document_id`` 前缀取（真实数据就是这样拼的），
+    简写的 ``document_id``（如 ``"d1"``）取不到日期时退回 T1 那天。
+    """
+    date_prefix = document_id.split(":")[0]
+    if record_date is None:
+        record_date = date_prefix if ":" in document_id else "2026-11-10"
     return RawMessage(
         id=id,
-        record_date=document_id.split(":")[0],
+        record_date=record_date,
         document_id=document_id,
         sender_id=sender_id,
         persona_id="",
@@ -149,17 +158,54 @@ class TestBuildItems:
         items = build_items([make_raw()])
         assert items[0]["update_mode"] == "append"
 
-    def test_timestamp_is_first_record_of_document(self) -> None:
-        """timestamp 取文档内最早那条，避免被摄取时刻顶替。"""
+    def test_timestamp_is_midnight_of_record_date(self) -> None:
+        """timestamp 取当天零点，不是该批首条记录的时刻。
+
+        文档级时间每 append 一次就被覆盖一次，所以它必须与「第几批」无关。
+        取首条记录的时间的话，同一天追加几次就把文档时间往后推几次。
+        """
         batch = [
             make_raw(id=1, sent_time=T1, document_id="d1"),
             make_raw(id=2, sent_time=T2, document_id="d1"),
         ]
         items = build_items(batch)
-        assert items[0]["timestamp"] == T1
+        assert items[0]["timestamp"] == "2026-11-10T00:00:00+08:00"
+
+    def test_timestamp_identical_across_batches_of_same_day(self) -> None:
+        """同一天的两批必须算出同一个 timestamp，覆盖才无害。"""
+        early = build_items([make_raw(id=1, sent_time="2026-11-10T00:00:03+08:00")])
+        late = build_items([make_raw(id=2, sent_time="2026-11-10T23:59:59+08:00")])
+        assert early[0]["timestamp"] == late[0]["timestamp"]
 
     def test_empty_batch(self) -> None:
         assert build_items([]) == []
+
+
+class TestDocumentTimestamp:
+    """文档级时间戳的推导。"""
+
+    def test_uses_record_date_not_sent_time_date(self) -> None:
+        """日期取 record_date，不取 message_sent_time 的前 10 位。
+
+        两者在负时区下可能差一天；record_date 在写入时已按本机时区算好，
+        与 document_id 里那个日期同源。
+        """
+        raw = make_raw(sent_time="2026-11-10T22:30:00-05:00")
+        raw.record_date = "2026-11-11"  # 本机已是次日
+        assert document_timestamp(raw) == "2026-11-11T00:00:00-05:00"
+
+    def test_keeps_offset(self) -> None:
+        raw = make_raw(sent_time="2026-11-10T10:30:00+08:00")
+        assert document_timestamp(raw).endswith("+08:00")
+
+    def test_drops_time_part(self) -> None:
+        raw = make_raw(sent_time="2026-11-10T23:59:59+08:00")
+        assert document_timestamp(raw) == "2026-11-10T00:00:00+08:00"
+
+    def test_missing_offset_is_tolerated(self) -> None:
+        """没有时区的老数据不硬凑，交给服务端按默认时区解释。"""
+        raw = make_raw(sent_time="2026-11-10T10:30:00")
+        assert document_timestamp(raw) == "2026-11-10T00:00:00"
 
 
 @dataclass

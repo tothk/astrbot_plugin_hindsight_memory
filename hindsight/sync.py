@@ -184,6 +184,38 @@ def split_batches(
     return batches
 
 
+def document_timestamp(raw: RawMessage) -> str:
+    """算出一条记录所属文档的文档级时间戳：当天零点。
+
+    Args:
+        raw: 任意一条属于该文档的记录。
+
+    Returns:
+        ``YYYY-MM-DDT00:00:00±HH:MM``；记录缺少时区时省略时区后缀。
+
+    Note:
+        **这个值必须与「第几批」无关。** 服务端每次 append 都会用新提交的
+        ``timestamp`` 覆盖文档的 ``event_date``（实测：先提交 01:00 再提交
+        00:00，文档的 event_date 最终变成 00:00），所以若按「本批第一条的
+        时间」算，同一天追加几次就把文档时间往后推几次，最终停在哪取决于
+        最后一次提交的运气。
+
+        取零点则每次追加算出的值恒等，覆盖也无害。语义也正好对上：
+        ``document_id`` 的边界是一天（``{record_date}:{umo}``），文档时间
+        就是这一天。
+
+        日期取自 ``raw.record_date`` 而不是 ``message_sent_time[:10]``：
+        前者在写入时已按本机时区算好、与 `document_id` 里那个日期同源，
+        后者在 ``-05:00`` 这类时区下会差一天。
+    """
+    # message_sent_time 形如 2026-11-11T01:00:00+08:00，末尾 6 位是时区。
+    offset = raw.message_sent_time[-6:]
+    if not offset.startswith(("+", "-")) or ":" not in offset:
+        # 老数据没有时区就不硬凑，交给服务端按默认时区解释。
+        offset = ""
+    return f"{raw.record_date}T00:00:00{offset}"
+
+
 def build_items(
     batch: Sequence[RawMessage], *, user_name: str = "", bot_name: str = ""
 ) -> list[dict]:
@@ -205,31 +237,32 @@ def build_items(
     Note:
         - ``update_mode="append"``：同一个 ``document_id`` 之前提交过就追加而不是
           重建。这是用户定下的语义。
-        - ``timestamp`` 取该文档内第一条记录的时间。不显式给的话，Hindsight 会把
-          「摄取时刻」当成事件发生时间，事后问「她什么时候说累的」就会答成同步
-          执行的那一刻。文档边界是一天，所以这里的粒度最多也就是一天。
+        - ``timestamp`` 走 :func:`document_timestamp`，即当天零点。不显式给的话，
+          Hindsight 会把「摄取时刻」当成事件发生时间，事后问「她什么时候说累的」
+          就会答成同步执行的那一刻。
     """
     lines_by_doc: dict[str, list[str]] = {}
-    first_time_by_doc: dict[str, str] = {}
+    timestamp_by_doc: dict[str, str] = {}
 
     for raw in batch:
         document_id = raw.document_id
         lines_by_doc.setdefault(document_id, []).append(
             render_line(raw, user_name=user_name, bot_name=bot_name)
         )
-        # setdefault 保证只记录第一次出现的时间，即该文档内最早的那条。
-        first_time_by_doc.setdefault(document_id, raw.message_sent_time)
+        # setdefault 保证每个文档只算一次（同一文档内结果恒等，重复算也无害）。
+        timestamp_by_doc.setdefault(document_id, document_timestamp(raw))
 
     return [
         {
             "content": _LINE_SEPARATOR.join(lines),
             "document_id": document_id,
             "update_mode": "append",
-            "timestamp": first_time_by_doc[document_id],
+            "timestamp": timestamp_by_doc[document_id],
         }
         # dict 保持插入顺序，所以 items 的顺序与记录首次出现的顺序一致。
         for document_id, lines in lines_by_doc.items()
     ]
+
 
 
 class SyncStore(Protocol):

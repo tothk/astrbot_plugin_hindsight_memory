@@ -53,13 +53,14 @@ class OkClient:
 
 
 def make_raw(row_id: int):
-    """投递路径只需要 id 与正文，别的字段用占位值。"""
+    """投递路径只需要 id、正文与文档归属，别的字段用占位值。"""
     return SimpleNamespace(
         id=row_id,
         role="user",
         sender_id="10001",
         sender_name="小满",
         raw_message=f"第 {row_id} 条",
+        record_date="2026-11-11",
         message_sent_time="2026-11-11T00:30:00+08:00",
         document_id="2026-11-11:umo",
     )
