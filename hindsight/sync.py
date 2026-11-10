@@ -27,6 +27,24 @@ from .client import HindsightClient, HindsightError
 _LINE_SEPARATOR = "\n"
 
 
+def speaker_of(raw: RawMessage) -> str:
+    """取这条记录在对话文本里的说话人标识。
+
+    优先用昵称而不是 ``sender_id``：Hindsight 会把 ``Name (time): text`` 里的
+    Name 解析成实体，数字 ID（QQ 号）解析出来只是 "user"，此后「她喜欢看海」
+    这类人格化事实就挂不到具体的人身上，召回时也匹配不到。实测同一段中文对话，
+    用 "Alice" 能提取出 ``Involving: Alice``，用 "10001" 只能得到 ``Involving: user``。
+
+    Args:
+        raw: 待渲染的记录。
+
+    Returns:
+        昵称；昵称为空时退回 ``sender_id``（至少不会丢掉"有个人说过话"）。
+    """
+    name = (raw.sender_name or "").strip()
+    return name or raw.sender_id
+
+
 def render_line(raw: RawMessage) -> str:
     """把一条记录渲染成对话文本里的一行。
 
@@ -34,7 +52,7 @@ def render_line(raw: RawMessage) -> str:
         raw: 待提交的原始记录。
 
     Returns:
-        形如 ``"123456 (2026-11-10T10:30:05+08:00): 今天有点累"`` 的单行文本。
+        形如 ``"小明 (2026-11-10T10:30:05+08:00): 今天有点累"`` 的单行文本。
         正文为空时只保留 ``"发送者 (时间):"`` 前缀。
 
     Note:
@@ -45,7 +63,7 @@ def render_line(raw: RawMessage) -> str:
     # splitlines() 而不是 replace("\n", " ")：Windows 的 \r\n 与旧 Mac 的 \r
     # 都能一并处理，顺带丢掉空行与每行首尾的空白。
     text = " ".join(part.strip() for part in raw.raw_message.splitlines() if part.strip())
-    prefix = f"{raw.sender_id} ({raw.message_sent_time}):"
+    prefix = f"{speaker_of(raw)} ({raw.message_sent_time}):"
     return f"{prefix} {text}" if text else prefix
 
 

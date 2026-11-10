@@ -182,6 +182,7 @@ def build_raw_message(
     umo: str,
     persona_id: str,
     now: datetime,
+    sender_name: str = "",
 ) -> RawMessage:
     """把一次对话装配成待落库的记录。
 
@@ -192,6 +193,8 @@ def build_raw_message(
         umo: 会话统一消息来源，形如 "platform:type:session_id"。
         persona_id: 人格 ID，未知时传空串。
         now: 记录时刻，由调用方传入以便测试（测试可传固定时间断言字段值）。
+        sender_name: 说话人显示名（昵称）。投递时优先用它当说话人，
+            拿不到才退回 ``sender_id``。
 
     Returns:
         尚未落库的 RawMessage。
@@ -208,6 +211,7 @@ def build_raw_message(
         record_date=day,
         document_id=document_id,
         sender_id=sender_id,
+        sender_name=sender_name,
         persona_id=persona_id,
         role=role,
         raw_message=text,

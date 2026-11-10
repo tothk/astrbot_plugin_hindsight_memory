@@ -10,8 +10,12 @@ class RawMessage(PBaseModel, table=True):
     record_date: str
     document_id: str
     sender_id: str
+    # 说话人显示名（昵称）。投递给 Hindsight 时用这个名字而不是 sender_id：
+    # 数字 ID 进对话文本会被抽取成实体 "user"，人格化事实就挂不到具体的人身上。
+    # 昵称拿不到时留空，渲染时回退到 sender_id。
+    sender_name: str = Field(default="")
     persona_id: str
-    role:str
+    role: str
     raw_message: str
     message_sent_time: str
     # 去重指纹：由 document_id + role + raw_message 计算，不含时间与人格。

@@ -43,9 +43,34 @@ class SqlModelManager:
             cur.execute("PRAGMA journal_size_limit=1048576")
             cur.close()
         PBaseModel.metadata.create_all(self._engine)
+        # create_all 只建新表，不会给已存在的表补列。开发期表结构改过几次，
+        # 用户的库里可能少了后来加的列（例如 sender_name），届时任何查询都会
+        # 报 "no such column"。这里做一次最小的补齐，不改类型、不删列。
+        self._ensure_columns()
         # 实测期间最常需要确认的就是"库到底落在哪"，启动时打一次即可。
         if self._log is not None:
             self._log.info(f"原始对话库位置: {db_file}")
+
+    def _ensure_columns(self) -> None:
+        """给已存在的表补上新增的可空列。
+
+        只处理「新加的、有默认值的列」这一种情况，够用且绝不破坏数据。
+        真要改类型或删列，还是得手工迁移。
+        """
+        expected = {"sender_name": "TEXT DEFAULT ''"}
+        with self._engine.begin() as conn:
+            existing = {
+                row[1] for row in conn.exec_driver_sql("PRAGMA table_info(rawmessage)")
+            }
+            for column, ddl in expected.items():
+                if column in existing:
+                    continue
+                conn.exec_driver_sql(
+                    f"ALTER TABLE rawmessage ADD COLUMN {column} {ddl}"
+                )
+                # 补列属于结构变更，值得留一条日志，便于排查"为什么突然能写了"。
+                if self._log is not None:
+                    self._log.info(f"数据库补列: rawmessage.{column}")
 
     def insert_raw(self, raw: RawMessage) -> RawMessage | None:
         """插入一条原始消息，返回带 id 的对象。

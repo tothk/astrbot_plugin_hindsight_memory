@@ -33,6 +33,35 @@ NotifyFunc = Callable[[AstrMessageEvent], Awaitable[None]]
 # 读配置失败时按它兜底，与宿主行为保持一致。
 _DEFAULT_WAKE_PREFIX = ("/",)
 
+# 机器人自己那一侧拿不到昵称时的显示名。
+#
+# 投递给 Hindsight 的对话文本里，说话人名字会被解析成实体；用 self_id 或
+# 平台 ID 的话会退化成没有意义的实体，所以这里给一个固定的中文称呼。
+_DEFAULT_BOT_NAME = "助手"
+
+
+def bot_display_name(context: Context, persona_id: str) -> str:
+    """取机器人当前人格的显示名，用作对话文本里的说话人。
+
+    Args:
+        context: 插件上下文，用于查人格。
+        persona_id: 本轮生效的人格 ID，未知时为空串。
+
+    Returns:
+        人格名；取不到就退回 ``_DEFAULT_BOT_NAME``。
+    """
+    if not persona_id:
+        return _DEFAULT_BOT_NAME
+    try:
+        # 这个方法在宿主里是同步的纯内存查找（persona_mgr.get_persona_v3_by_id），
+        # 不会读库也不会发网络请求，放在钩子里没有负担。
+        persona = context.persona_manager.get_persona_v3_by_id(persona_id)
+    except Exception:
+        # 人格名只是显示用，取不到不该影响记录本身。
+        return _DEFAULT_BOT_NAME
+    name = getattr(persona, "name", "") if persona is not None else ""
+    return str(name).strip() or _DEFAULT_BOT_NAME
+
 
 def read_wake_prefixes(
     context: Context,
@@ -168,6 +197,8 @@ class MessageCapture:
             build_raw_message(
                 role="user",
                 sender_id=event.get_sender_id(),
+                # 记下昵称：投递 Hindsight 时用它当说话人，数字 ID 会退化成 "user"。
+                sender_name=event.get_sender_name(),
                 text=message_str,
                 umo=event.unified_msg_origin,
                 persona_id=persona_id or "",
@@ -208,6 +239,9 @@ class MessageCapture:
             build_raw_message(
                 role="llm",
                 sender_id=bot_id,
+                # 机器人这一侧没有昵称，用当前人格名当说话人；
+                # 用 self_id 的话 Hindsight 会把它解析成没有意义的实体。
+                sender_name=bot_display_name(self._context, persona_id),
                 text=text,
                 umo=event.unified_msg_origin,
                 persona_id=persona_id or "",
