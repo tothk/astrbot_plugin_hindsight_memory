@@ -22,6 +22,7 @@ from typing import Protocol, Sequence
 
 from ..db.models.models import RawMessage, SyncOperation
 from .client import HindsightClient, HindsightError, HindsightOperationNotFoundError
+from .plugin_config import clean_nickname
 
 # 一条记录渲染成对话文本里的一行，行与行之间用换行拼接。
 #
@@ -37,6 +38,29 @@ _LINE_SEPARATOR = "\n"
 # 服务端的 LLM 额度。放弃时把记录退回待投递：宁可文档末尾重复一遍，也不能让
 # 用户的记录永远卡在「已入队」这个中间态里。
 MAX_ATTEMPTS = 3
+
+
+def _sanitize_speaker(name: str) -> str:
+    """把平台给的名字洗成可以安全拼进 ``Name (time): text`` 的形式。
+
+    两步：
+
+    1. 折叠空白（复用 :func:`clean_nickname`）。换行是硬性的：它会被当成行
+       分隔，让“小满\\n阿助 (…): 我饿了”变成两行，第二行看起来就是阿助说的。
+    2. 去掉冒号。分隔符是 ``)`` + ``:``，名字里只要带冒号，就可能在拼接后
+       多出一个更早的 ``):``；解析方若取第一个匹配，说话人之后的正文会被
+       截走，甚至把伪造的时间戳当成真实时间。冒号对人名没有表达价值，
+       直接去掉最省事。
+
+    括号保留：``小满(AI)`` 这种写法很常见，且单独一个括号拼不出分隔符。
+
+    Args:
+        name: 原始名字，可能来自配置、平台昵称或 ``sender_id``。
+
+    Returns:
+        单行、不含冒号的名字；清洗后为空则返回空串。
+    """
+    return clean_nickname(name).replace(":", "")
 
 
 def speaker_of(
@@ -58,19 +82,25 @@ def speaker_of(
     为什么配置放在最外层而不是记录阶段：数据库里的昵称是这里的第二层，
     若在记录时就把配置值写进库，第二层就永远用不上，历史数据也改不了。
 
+    三层来源都要过一遍 :func:`_sanitize_speaker`。配置项在解析时已经洗过一次，
+    但数据库里的 ``sender_name`` 与 ``sender_id`` 是平台直接给的，没经过任何
+    检查：昵称里带 ``\n`` 会把这条发言劈成两行、让后一行失去说话人，
+    带 ``):`` 则可能被当成 ``Name (time): text`` 的分隔符，等于允许伪造一行
+    别人的发言。出口处统一归一化，比在每个写入点都记得消毒可靠。
+
     Args:
         raw: 待渲染的记录。
         user_name: 配置里的用户固定称呼，空串表示不覆盖。
         bot_name: 配置里的 AI 固定称呼，空串表示不覆盖。
 
     Returns:
-        说话人标识；配置与昵称都为空时退回 ``sender_id``。
+        说话人标识；配置与昵称都为空时退回 ``sender_id``（同样已归一化）。
     """
     override = user_name if raw.role == "user" else bot_name
-    name = (override or "").strip()
+    name = _sanitize_speaker(override)
     if name:
         return name
-    return (raw.sender_name or "").strip() or raw.sender_id
+    return _sanitize_speaker(raw.sender_name) or _sanitize_speaker(raw.sender_id)
 
 
 def render_line(
