@@ -370,18 +370,45 @@ class HindsightSync:
             投递时某一批失败后立即返回，不再尝试后续批次：典型失败原因（服务
             没起、网络不通、token 错）对后面每一批同样成立，继续重试只会把错误
             日志刷满。
+
+            存储异常（锁超时、磁盘满、表结构不匹配）一律转成 ``error`` 而不是
+            向上抛。本节起所有 ``asyncio.to_thread(self._store...)`` 调用都可能
+            抛，而本方法的三个调用方——每日循环、手动指令、积压触发——全靠
+            「不抛」这个契约活着：每日循环一旦被穿透就永久停摆。
+
+            两段分开捕获：对账已经跑完的成果不该因为随后的投递失败而丢掉，
+            否则日志里明明「对账完成 3 个批次」，返回值却是一个空的失败摘要。
         """
-        outcome = await self.reconcile()
-        submitted = await self.submit(limit=limit)
+        try:
+            reconciled = await self.reconcile()
+        except asyncio.CancelledError:
+            # 插件卸载时的正常取消，不属于失败。
+            raise
+        except Exception as exc:
+            self._log.error(f"对账阶段因本地存储异常中断：{exc}")
+            reconciled = SyncOutcome()
+
+        try:
+            submitted = await self.submit(limit=limit)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._log.error(f"投递阶段因本地存储异常中断：{exc}")
+            return SyncOutcome(
+                completed=reconciled.completed,
+                retried=reconciled.retried,
+                released=reconciled.released,
+                error=f"本地数据库异常：{exc}",
+            )
 
         return SyncOutcome(
             messages=submitted.messages,
             batches=submitted.batches,
             documents=submitted.documents,
             flushed=submitted.flushed,
-            completed=outcome.completed,
-            retried=outcome.retried,
-            released=outcome.released,
+            completed=reconciled.completed,
+            retried=reconciled.retried,
+            released=reconciled.released,
             error=submitted.error,
         )
 
@@ -419,9 +446,14 @@ class HindsightSync:
             status = str(data.get("status") or "").lower()
 
             if status == "completed":
-                resolved = await asyncio.to_thread(
-                    self._store.resolve_operation, operation_id, status="completed"
-                )
+                try:
+                    resolved = await asyncio.to_thread(
+                        self._store.resolve_operation, operation_id, status="completed"
+                    )
+                except Exception as exc:
+                    # 单个批次写不进去就跳过它，别让别的批次跟着这轮白跑。
+                    self._log.error(f"标记批次完成失败（{operation_id}）：{exc}")
+                    continue
                 completed += 1
                 self._log.info(
                     f"对账完成：operation={operation_id} {resolved} 条记录已确认落地"
@@ -429,10 +461,13 @@ class HindsightSync:
                 continue
 
             if status in ("failed", "cancelled", "not_found"):
-                retried, released = await self._handle_failure(
-                    record, status=str(data.get("error_message") or status),
-                    retried=retried, released=released,
-                )
+                try:
+                    retried, released = await self._handle_failure(
+                        record, status=str(data.get("error_message") or status),
+                        retried=retried, released=released,
+                    )
+                except Exception as exc:
+                    self._log.error(f"处理失败批次出错（{operation_id}）：{exc}")
                 continue
 
             # pending / processing：还在跑，下一轮再看。
@@ -510,9 +545,17 @@ class HindsightSync:
             reason: 放弃的原因，写进日志便于排查。
 
         Returns:
-            被退回待投递的行数。
+            被退回待投递的行数；撤回本身失败时返回 0。
+
+        Note:
+            撤回失败只记日志、不往上抛：这批记录会继续留在「已入队」，
+            下一轮对账再试一次。抛出去则会让整轮同步连同别的批次一起中断。
         """
-        released_rows = self._store.release_operation(operation_id)
+        try:
+            released_rows = self._store.release_operation(operation_id)
+        except Exception as exc:
+            self._log.error(f"撤回批次失败（{operation_id}）：{exc}")
+            return 0
         self._log.warning(
             f"放弃批次 operation={operation_id}（{reason}），"
             f"{released_rows} 条记录退回待投递"
@@ -529,7 +572,12 @@ class HindsightSync:
             投递阶段的摘要：``messages`` / ``batches`` / ``documents`` /
             ``flushed``（成功入队的条数），失败时 ``error`` 非空。
         """
-        pending = await asyncio.to_thread(self._store.list_unflushed, limit)
+        try:
+            pending = await asyncio.to_thread(self._store.list_unflushed, limit)
+        except Exception as exc:
+            # 读不到待投递记录就是这轮没东西可投，转成 error 交给上层显示。
+            self._log.error(f"读取待提交记录失败：{exc}")
+            return SyncOutcome(error=f"本地数据库异常：{exc}")
         if not pending:
             self._log.debug("没有待提交的对话记录")
             return SyncOutcome()
@@ -584,19 +632,46 @@ class HindsightSync:
                 self._log.warning(
                     f"{awaited} 未返回 operation_id，无法对账，按已提交处理"
                 )
-                await asyncio.to_thread(
-                    self._store.mark_flushed, ids, 2
-                )
+                try:
+                    await asyncio.to_thread(self._store.mark_flushed, ids, 2)
+                except Exception as exc:
+                    # 服务端已收下、本地却标不上去：这批以后会被当成没投递而
+                    # 重复追加。写入失败无法补救，但要让它出现在返回值里，
+                    # 而不是安静地退化成「一切正常」。
+                    self._log.error(f"标记已提交失败（{awaited}）：{exc}")
+                    return SyncOutcome(
+                        messages=len(pending),
+                        batches=len(batches),
+                        documents=documents,
+                        flushed=flushed,
+                        error=f"本地数据库异常：{exc}",
+                    )
                 documents += len(items)
                 flushed += len(ids)
                 continue
 
-            await asyncio.to_thread(
-                self._store.mark_enqueued,
-                ids,
-                operation_id=result.operation_id,
-                items_count=len(items),
-            )
+            try:
+                await asyncio.to_thread(
+                    self._store.mark_enqueued,
+                    ids,
+                    operation_id=result.operation_id,
+                    items_count=len(items),
+                )
+            except Exception as exc:
+                # 同上：操作已在服务端排队，凭据却没落库。这批下一轮会被重新
+                # 提交并拿到新的 operation_id，于是文档末尾多一份内容。
+                # 宁可多一份也不能假装成功，所以记 error 并中断本轮。
+                self._log.error(
+                    f"记录入队凭据失败（{awaited}，"
+                    f"operation={result.operation_id}）：{exc}"
+                )
+                return SyncOutcome(
+                    messages=len(pending),
+                    batches=len(batches),
+                    documents=documents,
+                    flushed=flushed,
+                    error=f"本地数据库异常：{exc}",
+                )
             documents += len(items)
             flushed += len(ids)
             self._log.info(

@@ -135,7 +135,13 @@ class MemoryService:
         )
 
     async def stop(self) -> None:
-        """取消定时任务、后台投递任务并关闭连接池。"""
+        """取消定时任务、后台投递任务并关闭连接池。
+
+        两个任务都已经自己兜住异常，正常不会带异常结束；这里仍再吞一次
+        ``Exception``：任务是 await 出来的，万一它因为别的意外死掉，
+        ``await`` 会把那个异常重新抛进 ``terminate()``，而卸载阶段的报错
+        既没人处理、也掩盖了真正的原因。
+        """
         if self._sync_task is not None:
             self._sync_task.cancel()
             try:
@@ -143,6 +149,8 @@ class MemoryService:
             except asyncio.CancelledError:
                 # 主动取消不是异常，吞掉即可。
                 pass
+            except Exception as e:
+                self._log.error(f"后台投递任务结束时异常: {e}")
             self._sync_task = None
         if self._task is not None:
             self._task.cancel()
@@ -151,6 +159,8 @@ class MemoryService:
             except asyncio.CancelledError:
                 # 主动取消不是异常，吞掉即可。
                 pass
+            except Exception as e:
+                self._log.error(f"每日补投任务结束时异常: {e}")
             self._task = None
         await self._client.aclose()
 
@@ -204,15 +214,34 @@ class MemoryService:
             self._log.error(f"后台同步失败: {e}")
 
     async def _daily_loop(self) -> None:
-        """每天在配置的时刻补投一次未提交的记录。"""
+        """每天在配置的时刻补投一次未提交的记录。
+
+        循环体必须自己兜住异常：``while True`` 一旦被穿透就永久停摆，而这个
+        任务没有任何人会去重启它——插件看起来还在正常记录，只是再也不投递，
+        几天后才从「远端没有新记忆」里发现。所以这里捕获所有异常、记日志，
+        让循环活到下一次。
+        """
         while True:
-            delay = seconds_until(self._daily)
-            # 防御：配置里若写了非法时刻导致等待过久，也不该整轮静默。
-            await asyncio.sleep(max(_MIN_SLEEP, delay))
-            await self.sync_once(trigger="每日补投")
+            try:
+                delay = seconds_until(self._daily)
+                # 防御：配置里若写了非法时刻导致等待过久，也不该整轮静默。
+                await asyncio.sleep(max(_MIN_SLEEP, delay))
+                await self.sync_once(trigger="每日补投")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # 记 error 而不是让任务死掉：这个任务不会有人重启，穿透一次
+                # 就是永久停摆。失败后先歇一分钟再进下一轮，避免异常来自
+                # 配置本身时变成忙循环刷日志。
+                self._log.error(f"每日补投异常，本轮跳过，稍后重试: {e}")
+                await asyncio.sleep(_MIN_SLEEP)
 
     async def sync_once(self, *, trigger: str = "手动") -> SyncOutcome:
         """执行一轮投递，失败只记日志不抛。
+
+        调用方包括每日循环、手动指令和积压触发，三者都不适合处理异常：
+        每日循环被穿透就停摆，手动指令会让 AstrBot 回一句「插件出现异常」，
+        积压触发则是无人 await 的后台任务。所以这里把异常也收成结果对象。
 
         Args:
             trigger: 触发来源，仅用于日志，便于区分定时补投与手动触发。
@@ -221,7 +250,15 @@ class MemoryService:
             本轮的结果摘要。调用方（例如手动指令）可以据此告诉用户投了多少条；
             失败时 ``error`` 非空而不抛异常——投递失败不该让指令本身报错。
         """
-        outcome = await self._sync.run()
+        try:
+            outcome = await self._sync.run()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # run() 自己已经兜了一层，这里是第二道保险：万一将来有人往里加
+            # 新的存储调用而忘了处理，也不至于把上层拖垮。
+            self._log.error(f"{trigger}同步异常: {e}")
+            return SyncOutcome(error=str(e))
         if not outcome.ok:
             self._log.warning(f"{trigger}同步中断：{outcome.error}")
             return outcome

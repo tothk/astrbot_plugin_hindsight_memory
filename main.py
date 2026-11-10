@@ -93,7 +93,15 @@ class MyPlugin(Star):
         Yields:
             一条纯文本结果，告知投递了多少条或失败原因。
         """
-        outcome = await self._memory.sync_once(trigger="手动指令")
+        # 指令里不抛异常：handler 抛出去会被 AstrBot 兜住并回一句「插件出现异常」，
+        # 用户看到的是框架话术而不是「哪一步没成功」。sync_once 内部已经兜了两层，
+        # 这里再包一次是为了连它自己出意外（比如配置对象是坏的）也能给出可读结果。
+        try:
+            outcome = await self._memory.sync_once(trigger="手动指令")
+        except Exception as e:
+            self.logger.error(f"手动同步指令异常: {e}")
+            yield event.plain_result(f"❌ 同步失败：{e}")
+            return
         yield event.plain_result(format_sync_result(outcome))
 
     @filter.on_llm_request()
