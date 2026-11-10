@@ -4,3 +4,8 @@ desc: 记录每一句私聊原始对话，并沉淀为 Hindsight 长期记忆，
 version: v0.0.1 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: tothk # 作者
 repo: https://github.com/tothk/astrbot_plugin_hindsight_memory # 插件的仓库地址
+support_platforms:
+  - qq_official
+  - qq_official_webhook
+  - aiocqhttp
+astrbot_version: ">=4.29.3,<5"

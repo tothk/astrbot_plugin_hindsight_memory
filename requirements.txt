@@ -1,2 +1,1 @@
-# 本插件没有额外运行时依赖：sqlmodel / sqlalchemy 由 AstrBot 自带。
-# 测试依赖见 requirements-dev.txt。
+httpx>=0.27
