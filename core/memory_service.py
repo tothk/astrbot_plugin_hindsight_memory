@@ -110,6 +110,11 @@ class MemoryService:
         )
         self._daily = parse_daily_time(self._config.daily_time)
         self._task: asyncio.Task | None = None
+        # 自上次投递以来新落库的正文总字数。攒够 batch_chars 就提前投一次，
+        # 免得所有记录都要等每日定时才离开本地库。
+        self._pending_chars = 0
+        # 后台投递任务：同一时刻只允许一个，否则连发几条消息会并发抢同一批记录。
+        self._sync_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         """启动每日补投任务。"""
@@ -123,7 +128,15 @@ class MemoryService:
         )
 
     async def stop(self) -> None:
-        """取消定时任务并关闭连接池。"""
+        """取消定时任务、后台投递任务并关闭连接池。"""
+        if self._sync_task is not None:
+            self._sync_task.cancel()
+            try:
+                await self._sync_task
+            except asyncio.CancelledError:
+                # 主动取消不是异常，吞掉即可。
+                pass
+            self._sync_task = None
         if self._task is not None:
             self._task.cancel()
             try:
@@ -133,6 +146,55 @@ class MemoryService:
                 pass
             self._task = None
         await self._client.aclose()
+
+    def note_saved(self, text_length: int) -> None:
+        """累计新落库的正文长度，攒够一批就在后台提前投递。
+
+        由 ``Recorder`` 在**真正新增了一行**之后回调（判重丢弃的行不计数）。
+        这里必须是同步方法：调用方是同步的成功分支，不方便再往外传协程。
+
+        Args:
+            text_length: 刚落库那条记录的正文长度。
+        """
+        self._pending_chars += max(0, int(text_length))
+        if self._pending_chars < self._config.batch_chars:
+            return
+        self._start_background_sync()
+
+    def _start_background_sync(self) -> None:
+        """起一个后台投递任务；已有任务在跑时不再重复起。
+
+        并发投递会撞上同一批 ``flushed=0`` 的记录：两边都读到它、都提交一次，
+        结果是远端重复。所以同一时刻只允许一个后台任务。
+        """
+        if self._sync_task is not None and not self._sync_task.done():
+            self._log.debug("积压已达阈值，但上一轮后台同步仍在进行，跳过本次触发")
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # 没有运行中的事件循环（例如同步上下文里被误调用）：不该在这里报错，
+            # 记录还在库里，每日补投会兜住。
+            self._log.debug("当前没有运行中的事件循环，跳过积压触发")
+            return
+        # 先把计数清零：这一轮投的是此刻之前的积压，投递期间新写入的
+        # 记录会重新累计，避免同一批内容被反复触发。
+        self._pending_chars = 0
+        self._sync_task = loop.create_task(self._run_background_sync())
+
+    async def _run_background_sync(self) -> None:
+        """后台投递一轮，异常只记日志。
+
+        记录已经安全落在本地库里，所以后台失败不该往上抛：没有人 await 这个任务，
+        抛出去只会变成 "Task exception was never retrieved" 噪声。
+        """
+        try:
+            await self.sync_once(trigger="积压触发")
+        except asyncio.CancelledError:
+            # 插件卸载时的正常取消，交回给 stop() 处理。
+            raise
+        except Exception as e:
+            self._log.error(f"后台同步失败: {e}")
 
     async def _daily_loop(self) -> None:
         """每天在配置的时刻补投一次未提交的记录。"""

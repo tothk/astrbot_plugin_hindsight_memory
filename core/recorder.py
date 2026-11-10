@@ -228,17 +228,42 @@ class Recorder:
     一旦写入成功，_warned 复位，下次故障可以再次通知。
     """
 
-    def __init__(self, sql: "SqlModelManager", log: Logger) -> None:
+    def __init__(
+        self,
+        sql: "SqlModelManager",
+        log: Logger,
+        on_saved: Callable[[int], None] | None = None,
+    ) -> None:
         """初始化。
 
         Args:
             sql: 提供 insert_raw 的数据库管理器。
             log: 日志对象，通常是 astrbot 的 logger。按对象注入而不是直接
                 import astrbot.api，这样本模块仍可在没有宿主的测试里使用。
+            on_saved: 写入成功后的回调，参数是正文长度。用来让上层累计字数、
+                攒够一批就提前投递，免得死等每日定时。凭据：只有真正
+                新增了一行才回调——判重丢弃的行本来就在库里有，不该重复计数。
         """
         self._sql = sql
         self._log = log
+        self._on_saved = on_saved
         self._warned = False
+
+    def _notify_saved(self, text_length: int) -> None:
+        """把成功写入的正文长度报给上层。
+
+        回调出错只记日志：它属于投递侧的优化，绝不能让「记录已经写进库了」
+        这件事因为下游异常而被当成写库失败（那样会误发保存失败提示）。
+
+        Args:
+            text_length: 刚落库那条记录的正文长度。
+        """
+        if self._on_saved is None:
+            return
+        try:
+            self._on_saved(text_length)
+        except Exception as e:
+            self._log.error(f"记录成功后的回调失败: {e}")
 
     async def save(self, raw: RawMessage, notify: Callable[[], Awaitable[None]]) -> bool:
         """写入一条记录。
@@ -280,4 +305,5 @@ class Recorder:
             f"len={len(raw.raw_message)}"
         )
         self._warned = False
+        self._notify_saved(len(raw.raw_message))
         return True

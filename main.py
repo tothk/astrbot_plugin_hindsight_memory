@@ -38,11 +38,13 @@ class MyPlugin(Star):
         # self.logger 是 AstrBot 为本插件单独准备的 logger（面板里可单独调级别），
         # 比模块级的 astrbot 全局 logger 更适合记录运行期信息。
         self._sql = SqlModelManager(self._plugin_paths, self.logger)
-        self._recorder = Recorder(self._sql, self.logger)
+        # 先建记忆服务，再建 Recorder：Recorder 需要把「又存了一条」的事件
+        # 报给它，攒够字数才能提前投递。两者之间只有这一条单向依赖。
+        self._memory = MemoryService(self._hindsight, self._sql, self.logger)
+        self._recorder = Recorder(self._sql, self.logger, self._memory.note_saved)
         self._capture = MessageCapture(
             self.context, self._recorder, self._notify_save_failed, self.logger
         )
-        self._memory = MemoryService(self._hindsight, self._sql, self.logger)
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""

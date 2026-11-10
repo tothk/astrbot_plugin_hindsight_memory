@@ -96,6 +96,55 @@ class TestSaveSuccess:
             assert len(session.exec(select(RawMessage)).all()) == 2
 
 
+class TestSaveCallback:
+    """写入成功后的回调：只有真正新增了行才报长度。"""
+
+    async def test_callback_receives_text_length(self, sql, log: ListLog):
+        lengths = []
+        recorder = Recorder(sql, log, lengths.append)
+
+        await recorder.save(make_raw(text="一二三"), Notifier())
+
+        assert lengths == [3]
+
+    async def test_duplicate_does_not_trigger_callback(self, sql, log: ListLog):
+        # 判重丢弃的行本来就在库里，再计一次会把阈值推高、导致迟迟不投递。
+        lengths = []
+        recorder = Recorder(sql, log, lengths.append)
+
+        await recorder.save(make_raw(), Notifier())
+        await recorder.save(make_raw(), Notifier())
+
+        assert len(lengths) == 1
+
+    async def test_failure_does_not_trigger_callback(self, log: ListLog):
+        lengths = []
+        recorder = Recorder(BoomSql(), log, lengths.append)
+
+        await recorder.save(make_raw(), Notifier())
+
+        assert lengths == []
+
+    async def test_callback_error_is_swallowed(self, sql, log: ListLog):
+        # 记录已经落库了；回调出错不能反过来变成「写库失败」误发提示。
+        def boom(_length):
+            raise RuntimeError("回调炸了")
+
+        recorder = Recorder(sql, log, boom)
+        notify = Notifier()
+
+        saved = await recorder.save(make_raw(), notify)
+
+        assert saved is True
+        assert notify.calls == 0
+        assert any("回调失败" in msg for msg in log.text_of("error"))
+
+    async def test_no_callback_is_fine(self, sql, log: ListLog):
+        recorder = Recorder(sql, log)
+
+        assert await recorder.save(make_raw(), Notifier()) is True
+
+
 class TestSaveFailure:
     async def test_failure_returns_false_and_notifies(self, log: ListLog):
         recorder = Recorder(BoomSql(), log)
