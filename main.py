@@ -118,7 +118,9 @@ class MyPlugin(Star):
         if not memory:
             return
         # 追加到系统提示末尾而不是覆盖：宿主拼好的设定（人格、工具说明）必须保留。
-        req.system_prompt = f"{req.system_prompt}\n\n{memory}".strip()
+        # 必须 `or ""`：没有设置人格时 system_prompt 是 None，直接插值会让模型
+        # 收到字面量 "None" 作为系统提示的第一行。
+        req.system_prompt = f"{req.system_prompt or ''}\n\n{memory}".strip()
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):

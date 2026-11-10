@@ -1,9 +1,9 @@
 {
   "hindsight_host": {
     "description": "Hindsight 服务地址",
-    "hint": "记忆服务的地址，例如 localhost 或 192.168.1.10。",
+    "hint": "记忆服务的地址，例如 localhost。",
     "type": "string",
-    "default": "192.168.100.102"
+    "default": "localhost"
   },
   "hindsight_port": {
     "description": "Hindsight 服务端口",
