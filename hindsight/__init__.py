@@ -2,6 +2,7 @@
 
 from .client import (
     HindsightAuthError,
+    HindsightBankNotFoundError,
     HindsightClient,
     HindsightConnectionError,
     HindsightError,
@@ -12,6 +13,7 @@ from .client import (
 
 __all__ = [
     "HindsightAuthError",
+    "HindsightBankNotFoundError",
     "HindsightClient",
     "HindsightConnectionError",
     "HindsightError",

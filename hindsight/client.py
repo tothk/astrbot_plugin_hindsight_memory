@@ -52,6 +52,19 @@ class HindsightRequestError(HindsightError):
     """
 
 
+class HindsightBankNotFoundError(HindsightRequestError):
+    """目标记忆库不存在（HTTP 404）。
+
+    单独成一类是因为它可恢复：服务端不会因为你 retain 就凭空建库，而召回
+    一个还没写过东西的库会稳定返回 404。调用方可以 ``ensure_bank()`` 建库
+    再重试，其它 4xx 则没有这种补救。
+
+    Note:
+        客户端里所有业务路径都挂在 bank 下，因此这里把 404 一律当作
+        「库不存在」。将来若加入按 memory_id 查询的接口，需要重新区分。
+    """
+
+
 class HindsightServerError(HindsightError):
     """服务端错误（HTTP 5xx），或响应体不是合法 JSON。"""
 
@@ -290,6 +303,53 @@ class HindsightClient:
         """
         return await self._get("/health")
 
+    async def bank_exists(self, bank_id: str) -> bool:
+        """检查记忆库是否已存在。
+
+        服务端没有 ``GET /v1/default/banks/{bank_id}``（对该路径只开放
+        DELETE/PATCH/PUT），所以只能列出后逐个比对 ``bank_id``。
+        ``q`` 是**子串**过滤，必须再做一次精确比较，否则 ``dev`` 会被
+        ``dev-test`` 的存在骗过去。
+
+        Args:
+            bank_id: 记忆库标识。
+
+        Returns:
+            存在返回 True。
+        """
+        wanted = (bank_id or "").strip()
+        if not wanted:
+            raise ValueError("bank_id 不能为空")
+        data = await self._get("/v1/default/banks", params={"q": wanted, "limit": 100})
+        for item in data.get("banks") or []:
+            if item.get("bank_id") == wanted:
+                return True
+        return False
+
+    async def ensure_bank(self, bank_id: str) -> bool:
+        """确保记忆库存在，不存在则以默认配置创建。
+
+        服务端不会因为一次 retain/recall 就自动建库：召回一个空库会稳定
+        返回 404 ``Bank 'xxx' not found``。首次运行的插件因此永远召回失败。
+
+        用 ``PUT /v1/default/banks/{bank_id}`` 建库（同一个操作也用于更新，
+        重复调用返回 200，天然幂等）。空 body 表示全部取服务端默认值，
+        所以这里**不传任何字段**：传了反而会覆盖用户在该库上做过的配置。
+
+        Args:
+            bank_id: 记忆库标识。
+
+        Returns:
+            本次调用是否真的创建了库（已存在时为 False）。
+        """
+        wanted = (bank_id or "").strip()
+        if await self.bank_exists(wanted):
+            return False
+        await self._request(
+            "PUT", f"/v1/default/banks/{_quote_bank(wanted)}", json={}
+        )
+        return True
+
     async def aclose(self) -> None:
         """关闭自建的连接池。
 
@@ -318,9 +378,9 @@ class HindsightClient:
         """发一个 POST 并解析响应。"""
         return await self._request("POST", path, json=payload)
 
-    async def _get(self, path: str) -> dict:
+    async def _get(self, path: str, **kwargs) -> dict:
         """发一个 GET 并解析响应。"""
-        return await self._request("GET", path)
+        return await self._request("GET", path, **kwargs)
 
     async def _request(self, method: str, path: str, **kwargs) -> dict:
         """统一的请求与异常翻译。
@@ -370,6 +430,11 @@ class HindsightClient:
         status = response.status_code
         detail = _extract_detail(response)
 
+        if status == 404:
+            # 业务路径全部挂在 bank 下，404 的语义就是「这个库没有」。
+            raise HindsightBankNotFoundError(
+                f"记忆库不存在（HTTP 404）：{detail}"
+            )
         if status in (401, 403):
             raise HindsightAuthError(
                 f"鉴权失败（HTTP {status}）：{detail}", token_present=self.token_present

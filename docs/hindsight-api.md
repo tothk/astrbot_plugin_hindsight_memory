@@ -71,7 +71,10 @@ Hindsight **不保存原始对话**。它把输入内容交给 LLM 抽取成结�
 | **POST** | **`/v1/default/banks/{bank_id}/memories`** | **写入（retain）** |
 | **POST** | **`/v1/default/banks/{bank_id}/memories/recall`** | **召回** |
 | **POST** | **`/v1/default/banks/{bank_id}/reflect`** | **反思作答** |
-| GET | `/v1/default/banks` | 列出记忆库（支持 `q` 搜索、分页） |
+| GET | `/v1/default/banks` | 列出记忆库（支持 `q` 子串搜索、分页） |
+| **PUT** | **`/v1/default/banks/{bank_id}`** | **创建或更新记忆库**（空 body = 全取默认值，幂等） |
+| DELETE | `/v1/default/banks/{bank_id}` | 删除记忆库及其全部内容 |
+| GET/PATCH | `/v1/default/banks/{bank_id}/config` | 读取 / 局部更新该库的配置（body 需 `{"updates": {...}}`） |
 | GET | `/v1/default/banks/{bank_id}/graph` | 记忆图谱数据 |
 | GET | `/v1/default/banks/{bank_id}/memories/list` | 分页列出记忆单元（可按类型、文档、实体、时间窗过滤） |
 | GET | `/v1/default/banks/{bank_id}/memories/{memory_id}` | 取单条记忆 |
@@ -350,7 +353,7 @@ schema 规则：必须是对象且至少一个属性；属性类型限 `string`/
 | 状态码 | 含义 | 处理建议 |
 |---|---|---|
 | `401` / `403` | 鉴权失败 | 分两路文案：token 为空 → 提示去配置；token 非空 → 提示无效或过期 |
-| `404` | bank 不存在（多数端点） | 先创建 bank，或检查 `bank_id` |
+| `404` | bank 不存在（多数端点） | 先创建 bank，或检查 `bank_id`。**服务端不会因为 retain/recall 自动建库**，详见 8.5 |
 | `422` | 请求体校验失败 | 打印响应体里的 `detail`，通常是字段类型或必填项问题 |
 | `503` | 数据库不可达 | 服务端问题，重试 + 退避 |
 
@@ -396,15 +399,41 @@ items = [{
 
 定时任务扫描 `flushed = 0` 的记录，如果为空就什么都不做（不要发空 `items` 数组，那会返回 422）。补投失败要记日志，且**不要**把 `flushed` 置位。
 
-### 8.5 本项目的字段映射
+### 8.5 记忆库不存在时要主动创建
+
+服务端对「不存在的 bank」有两条不一致的行为，实测（1.2.0）：
+
+| 操作 | 对不存在的 bank |
+|---|---|
+| `POST .../memories`（retain） | **200**，并顺带把 bank 建出来 |
+| `POST .../memories/recall` | **404** `Bank 'xxx' not found` |
+
+后果：一个刚装好的插件，第一次对话必然走在 retain 之前，于是召回永远 404，表现为「有记录、但 AI 一直记不住你」。日志里只有一行 `记忆召回失败：请求被拒绝（HTTP 404）：Bank 'default' not found`。
+
+正确做法是在召回侧兜底：
+
+```python
+try:
+    return await client.recall(bank_id, query, max_tokens=1024)
+except HindsightBankNotFoundError:          # 404 单独成一个异常类型
+    await client.ensure_bank(bank_id)        # PUT /v1/default/banks/{bank_id}，body 传 {}
+    return await client.recall(bank_id, query, max_tokens=1024)   # 只重试一次
+```
+
+三个容易写错的点：
+
+1. **建库用 `PUT /v1/default/banks/{bank_id}`，body 传 `{}`**。传字段会覆盖用户在该库上做过的配置（`retain_mission`、`retain_chunk_size` 等）。空 body 表示「缺什么补默认值」，且该接口本身就幂等（重复 PUT 返回 200）。
+2. **不能靠「列出所有 bank 再找」来判断存在性并不可靠** —— `GET /v1/default/banks` 没有按 id 取单条的路由（`/v1/default/banks/{bank_id}` 只开放 DELETE/PATCH/PUT），只能用 `?q=` 过滤。而 `q` 是**子串**匹配：查 `dev` 时 `dev-test` 也会命中，必须对返回的 `bank_id` 再做一次精确比较。
+3. **只重试一次**。建完库还 404，说明问题不在「库缺失」（可能是 PUT 被权限拒绝、bank_id 非法），再重试就是死循环。
+
+### 8.6 本项目的字段映射
 
 | 本地 `rawmessagesqlite` | Hindsight |
 |---|---|
 | `raw_message` | `content` 里每行的正文部分 |
-| `sender_id` | 每行的说话人前缀（`Name` 位置） |
-| `message_sent_time` | 每行括号内的 `timestamp`，同时作为 item 的 `timestamp`（取批内最新） |
-| `role` | 可用于区分说话人显示名（`user`→用户 id，`llm`→bot 名） |
-| `document_id` | 原样作为 `document_id` |
+| `sender_name`（为空时退回 `sender_id`） | 每行的说话人前缀（`Name` 位置）。**必须用昵称**：传 `10001` 这类数字串时，Hindsight 抽出的实体名会退化成 `user`，人格化事实（「她喜欢看海」）就建立不起来 |
+| `message_sent_time` | 每行括号内的 `timestamp`，同时作为 item 的 `timestamp`（取文档内第一条） |
+| `role` | 用于区分说话人显示名（`user` → 用户昵称，`llm` → bot 人格名） || `document_id` | 原样作为 `document_id`（本项目格式 `日期:umo`） |
 | `record_date` | 不传（已隐含在 `document_id` 里），或塞进 `metadata` |
 
 ---

@@ -9,6 +9,7 @@ import pytest
 
 from astrbot_plugin_hindsight_memory.hindsight.client import (
     HindsightAuthError,
+    HindsightBankNotFoundError,
     HindsightClient,
     HindsightConnectionError,
     HindsightRequestError,
@@ -306,6 +307,20 @@ class TestErrorTranslation:
         with pytest.raises(HindsightRequestError):
             await make_client(rec).retain("b1", [{"content": "x"}])
 
+    async def test_404_becomes_bank_not_found(self):
+        # 单独成类，调用方才有机会「建库后重试」而不是把 404 当普通拒绝。
+        rec = Recorder(
+            {"/recall": httpx.Response(404, json={"detail": "Bank 'b1' not found"})}
+        )
+        with pytest.raises(HindsightBankNotFoundError):
+            await make_client(rec).recall("b1", "q")
+
+    async def test_bank_not_found_is_a_request_error(self):
+        # 仍然能被旧代码的 except HindsightRequestError 接住。
+        rec = Recorder({"/recall": httpx.Response(404, json={"detail": "nope"})})
+        with pytest.raises(HindsightRequestError):
+            await make_client(rec).recall("b1", "q")
+
     async def test_503_becomes_server_error(self):
         rec = Recorder({"/memories": httpx.Response(503, text="db down")})
         with pytest.raises(HindsightServerError):
@@ -333,6 +348,88 @@ class TestErrorTranslation:
         client = HindsightClient("http://localhost:8888", http_client=http)
         with pytest.raises(HindsightConnectionError):
             await client.retain("b1", [{"content": "x"}])
+
+
+# ----------------------------------------------------------------------
+# 记忆库存在性
+# ----------------------------------------------------------------------
+
+
+class TestBankExists:
+    async def test_returns_true_on_exact_match(self):
+        rec = Recorder(
+            {"/banks": httpx.Response(200, json={"banks": [{"bank_id": "b1"}]})}
+        )
+
+        assert await make_client(rec).bank_exists("b1") is True
+        assert rec.last.url.path == "/v1/default/banks"
+
+    async def test_q_is_only_a_substring_filter(self):
+        # 服务端的 q 是子串匹配，dev-test 存在不代表 dev 存在，必须精确比对。
+        rec = Recorder(
+            {"/banks": httpx.Response(200, json={"banks": [{"bank_id": "b1-extra"}]})}
+        )
+
+        assert await make_client(rec).bank_exists("b1") is False
+
+    async def test_empty_list_means_missing(self):
+        rec = Recorder({"/banks": httpx.Response(200, json={"banks": []})})
+
+        assert await make_client(rec).bank_exists("b1") is False
+
+    async def test_missing_banks_key_is_tolerated(self):
+        rec = Recorder({"/banks": httpx.Response(200, json={})})
+
+        assert await make_client(rec).bank_exists("b1") is False
+
+    async def test_rejects_blank_bank_id(self):
+        with pytest.raises(ValueError):
+            await make_client(Recorder()).bank_exists("  ")
+
+
+class TestEnsureBank:
+    async def test_skips_create_when_present(self):
+        rec = Recorder(
+            {"/banks": httpx.Response(200, json={"banks": [{"bank_id": "b1"}]})}
+        )
+
+        assert await make_client(rec).ensure_bank("b1") is False
+        # 只有列表请求，没有 PUT。
+        assert len(rec.requests) == 1
+
+    async def test_creates_when_missing(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            rec.requests.append(request)
+            if request.method == "GET":
+                return httpx.Response(200, json={"banks": []})
+            return httpx.Response(200, json={"bank_id": "b1"})
+
+        rec = Recorder()
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client = HindsightClient("http://localhost:8888", http_client=http)
+
+        assert await client.ensure_bank("b1") is True
+
+        put = rec.requests[-1]
+        assert put.method == "PUT"
+        assert put.url.path == "/v1/default/banks/b1"
+        # 空 body：传字段会覆盖用户在该库上做过的配置。
+        assert put.content == b"{}"
+
+    async def test_bank_id_is_url_encoded(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            rec.requests.append(request)
+            if request.method == "GET":
+                return httpx.Response(200, json={"banks": []})
+            return httpx.Response(200, json={})
+
+        rec = Recorder()
+        http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        client = HindsightClient("http://localhost:8888", http_client=http)
+
+        await client.ensure_bank("a/b")
+
+        assert "a%2Fb" in str(rec.requests[-1].url)
 
 
 # ----------------------------------------------------------------------
