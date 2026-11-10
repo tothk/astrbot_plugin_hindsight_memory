@@ -12,6 +12,7 @@ from astrbot_plugin_hindsight_memory.core.recorder import (
     resolve_bot_id,
     should_record_reply,
     should_record_user_text,
+    strip_bot_at,
     strip_wake_prefix,
 )
 
@@ -57,6 +58,48 @@ class TestStripWakePrefix:
         # 而真正的指令由 AstrBot 的 CommandFilter 处理，不会走到这里。
         text = strip_wake_prefix("/今天好累", ["/"])
         assert should_record_user_text(text) is True
+
+
+class TestStripBotAt:
+    """QQ 官方机器人私聊消息前面的 @机器人 占位符。"""
+
+    def test_qq_official_prefix_is_removed(self):
+        # 实测库里存的是 "[At:qq_official] 你看一下记忆存储插件……"。
+        assert strip_bot_at("[At:qq_official] 今天好累", "qq_official") == "今天好累"
+
+    def test_qq_official_prefix_without_text_becomes_empty(self):
+        # 只 @ 不说话，剥完是空串，交给 should_record_user_text 判空跳过。
+        assert strip_bot_at("[At:qq_official]", "qq_official") == ""
+
+    def test_other_platform_is_untouched(self):
+        # 别的适配器不会产生这个组件；用户自己打的这串字符不能被无声吃掉。
+        assert strip_bot_at("[At:qq_official] 今天", "aiocqhttp") == "[At:qq_official] 今天"
+
+    def test_qq_official_webhook_is_untouched(self):
+        # webhook 版适配器不追加该组件，也不该剥。
+        assert (
+            strip_bot_at("[At:qq_official] 今天", "qq_official_webhook")
+            == "[At:qq_official] 今天"
+        )
+
+    def test_text_without_prefix_on_qq_official(self):
+        assert strip_bot_at("今天好累", "qq_official") == "今天好累"
+
+    def test_prefix_in_the_middle_is_kept(self):
+        # 只剥开头：正文中间出现的同样字符串是用户说的内容。
+        assert strip_bot_at("今天 [At:qq_official] 好累", "qq_official") == (
+            "今天 [At:qq_official] 好累"
+        )
+
+    def test_at_others_is_kept(self):
+        # 只针对机器人自己，@别人是有意义的内容。
+        assert strip_bot_at("[At:12345] 你好", "qq_official") == "[At:12345] 你好"
+
+    def test_wake_prefix_still_caught_after_stripping_at(self):
+        # 关键顺序：先剥 @ 再剥唤醒前缀，否则 "/今天好累" 匹配不到 "/"。
+        text = strip_bot_at("[At:qq_official] /今天好累", "qq_official")
+        assert strip_wake_prefix(text, ["/"]) == "今天好累"
+        assert should_record_user_text(strip_wake_prefix(text, ["/"])) is True
 
 
 class TestShouldRecordUserText:

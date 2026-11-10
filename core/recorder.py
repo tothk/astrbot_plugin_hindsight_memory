@@ -79,6 +79,41 @@ def strip_wake_prefix(text: str, wake_prefixes: Sequence[str]) -> str:
     return text
 
 
+# 只有 QQ 官方机器人适配器会往每条私聊消息前面塞一个 @机器人 组件，
+# 渲染成 outline 里就是这段前缀。见
+# astrbot/core/platform/sources/qqofficial/qqofficial_platform_adapter.py 的
+# 私聊分支：msg.append(At(qq="qq_official"))。
+_QQ_OFFICIAL_PLATFORM = "qq_official"
+_QQ_OFFICIAL_AT_PREFIX = "[At:qq_official]"
+
+
+def strip_bot_at(text: str, platform_name: str) -> str:
+    """去掉消息开头的"@机器人"占位符。
+
+    QQ 官方机器人适配器在私聊里会给每条消息追加一个 @机器人 组件，
+    get_message_outline() 把它渲染成 "[At:qq_official]"，于是库里存的
+    正文全是 "[At:qq_official] 你看一下……"。这段前缀不是用户说的话，
+    送进 Hindsight 会干扰实体与事实抽取。
+
+    只对 qq_official 生效：其他适配器不会产生这个组件，万一用户自己
+    打了这串字符，也不该被无声吃掉。qq_official_webhook 适配器同样
+    不追加该组件，故不在处理范围内。
+
+    Args:
+        text: 消息正文，通常是 get_message_outline() 的结果。
+        platform_name: event.get_platform_name() 的返回值。
+
+    Returns:
+        去掉前缀后的正文；平台不匹配或没有前缀时原样返回。
+    """
+    if platform_name != _QQ_OFFICIAL_PLATFORM:
+        return text
+    if not text.startswith(_QQ_OFFICIAL_AT_PREFIX):
+        return text
+    # 组件之间用空格拼接，剥掉占位符后要再 strip() 一次。
+    return text[len(_QQ_OFFICIAL_AT_PREFIX) :].strip()
+
+
 def should_record_user_text(text: str, *, is_command: bool = False) -> bool:
     """判断一条用户消息是否应当记录。
 

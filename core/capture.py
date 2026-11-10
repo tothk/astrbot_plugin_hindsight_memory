@@ -24,6 +24,7 @@ from .recorder import (
     resolve_bot_id,
     should_record_reply,
     should_record_user_text,
+    strip_bot_at,
     strip_wake_prefix,
 )
 
@@ -180,8 +181,12 @@ class MessageCapture:
         """
         # get_message_outline() 读的是原始消息链，wake_prefix 只被 AstrBot
         # 从 event.message_str 上剥掉，所以这里要自己再剥一次。
+        #
+        # 先剥 @机器人 占位符再剥唤醒前缀：QQ 官方机器人会把 @ 组件排在
+        # 最前面，"/今天好累" 在 outline 里是 "[At:qq_official] /今天好累"，
+        # 不先剥掉 @ 就匹配不到前缀。
         message_str = strip_wake_prefix(
-            event.get_message_outline(),
+            strip_bot_at(event.get_message_outline(), event.get_platform_name()),
             read_wake_prefixes(self._context, event, self._log),
         )
         is_command = is_command_event(event)
