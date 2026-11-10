@@ -12,6 +12,7 @@ from astrbot_plugin_hindsight_memory.hindsight.client import (
     HindsightBankNotFoundError,
     HindsightClient,
     HindsightConnectionError,
+    HindsightOperationNotFoundError,
     HindsightRequestError,
     HindsightServerError,
     _drop_none,
@@ -241,6 +242,127 @@ class TestRetain:
         await make_client(rec).retain("b1", [item])
         assert b'"update_mode":"append"' in rec.last.content
         assert b'"document_id":"d1"' in rec.last.content
+
+    async def test_defaults_to_async(self):
+        """默认走异步：同步抽一次要 80 秒以上，HTTP 客户端等不起。"""
+        rec = Recorder({"/memories": httpx.Response(200, json={"success": True})})
+        await make_client(rec).retain("b1", [{"content": "x"}])
+        assert b'"async":true' in rec.last.content
+
+    async def test_sync_mode_can_be_requested(self):
+        rec = Recorder({"/memories": httpx.Response(200, json={"success": True})})
+        await make_client(rec).retain("b1", [{"content": "x"}], is_async=False)
+        assert b'"async":false' in rec.last.content
+
+    async def test_operation_id_is_sent(self):
+        rec = Recorder({"/memories": httpx.Response(200, json={"success": True})})
+        await make_client(rec).retain("b1", [{"content": "x"}], operation_id="op-1")
+        assert b'"operation_id":"op-1"' in rec.last.content
+
+    async def test_operation_id_omitted_when_none(self):
+        """不传时不能发 null：服务端对显式的 null 与「不提供」处理可能不同。"""
+        rec = Recorder({"/memories": httpx.Response(200, json={"success": True})})
+        await make_client(rec).retain("b1", [{"content": "x"}])
+        assert b"operation_id" not in rec.last.content
+
+    async def test_parses_operation_id(self):
+        rec = Recorder(
+            {
+                "/memories": httpx.Response(
+                    200,
+                    json={"success": True, "async": True, "operation_id": "op-abc"},
+                )
+            }
+        )
+        result = await make_client(rec).retain("b1", [{"content": "x"}])
+        assert result.operation_id == "op-abc"
+
+    async def test_falls_back_to_operation_ids_list(self):
+        """items 用了不同策略被拆组时，服务端改给数组。"""
+        rec = Recorder(
+            {
+                "/memories": httpx.Response(
+                    200,
+                    json={
+                        "success": True,
+                        "async": True,
+                        "operation_id": None,
+                        "operation_ids": ["op-1", "op-2"],
+                    },
+                )
+            }
+        )
+        result = await make_client(rec).retain("b1", [{"content": "x"}])
+        assert result.operation_id == "op-1"
+
+    async def test_missing_operation_id_becomes_empty_string(self):
+        """同步模式下响应里没有 operation_id，不能变成 None。"""
+        rec = Recorder({"/memories": httpx.Response(200, json={"success": True})})
+        result = await make_client(rec).retain("b1", [{"content": "x"}], is_async=False)
+        assert result.operation_id == ""
+
+    async def test_timeout_can_be_overridden(self):
+        rec = Recorder({"/memories": httpx.Response(200, json={"success": True})})
+        await make_client(rec).retain("b1", [{"content": "x"}], timeout=5.0)
+        # MockTransport 不执行真实超时，这里只确认参数被接受、请求照常发出
+        assert rec.last.url.path.endswith("/memories")
+
+
+class TestOperations:
+    """查询与重试操作。"""
+
+    async def test_list_operations_builds_query(self):
+        rec = Recorder({"/operations": httpx.Response(200, json={"operations": []})})
+        await make_client(rec).list_operations(
+            "b1", status="failed", type_="batch_retain", limit=50, exclude_parents=True
+        )
+        params = rec.last.url.params
+        assert params["status"] == "failed"
+        assert params["type"] == "batch_retain"
+        assert params["limit"] == "50"
+        assert params["exclude_parents"] == "true"
+
+    async def test_list_operations_omits_none(self):
+        rec = Recorder({"/operations": httpx.Response(200, json={"operations": []})})
+        await make_client(rec).list_operations("b1")
+        params = rec.last.url.params
+        assert "status" not in params
+        assert "type" not in params
+
+    async def test_get_operation_hits_id_path(self):
+        rec = Recorder({"/operations/op-1": httpx.Response(200, json={"status": "completed"})})
+        data = await make_client(rec).get_operation("b1", "op-1")
+        assert rec.last.method == "GET"
+        assert rec.last.url.path == "/v1/default/banks/b1/operations/op-1"
+        assert data["status"] == "completed"
+
+    async def test_get_operation_rejects_empty_id(self):
+        rec = Recorder()
+        with pytest.raises(ValueError):
+            await make_client(rec).get_operation("b1", "  ")
+        assert rec.requests == []
+
+    async def test_retry_operation_posts_to_retry(self):
+        rec = Recorder({"/retry": httpx.Response(200, json={"success": True})})
+        await make_client(rec).retry_operation("b1", "op-1")
+        assert rec.last.method == "POST"
+        assert rec.last.url.path == "/v1/default/banks/b1/operations/op-1/retry"
+
+    async def test_operation_404_is_distinguished_from_bank_404(self):
+        """操作不存在与库不存在都是 404，但补救办法完全不同。"""
+        rec = Recorder({"/operations/gone": httpx.Response(404, json={"detail": "not found"})})
+        with pytest.raises(HindsightOperationNotFoundError):
+            await make_client(rec).get_operation("b1", "gone")
+
+    async def test_bank_404_still_uses_bank_error(self):
+        rec = Recorder({"/memories": httpx.Response(404, json={"detail": "bank not found"})})
+        with pytest.raises(HindsightBankNotFoundError):
+            await make_client(rec).retain("nope", [{"content": "x"}])
+
+    async def test_operation_id_is_url_encoded(self):
+        rec = Recorder({"/operations/a%2Fb": httpx.Response(200, json={})})
+        await make_client(rec).get_operation("b1", "a/b")
+        assert "/operations/a%2Fb" in str(rec.last.url)
 
 
 # ----------------------------------------------------------------------

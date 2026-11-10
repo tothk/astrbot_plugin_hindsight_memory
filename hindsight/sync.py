@@ -164,8 +164,8 @@ class UnflushedStore(Protocol):
         """按 id 升序取出尚未提交的记录。"""
         ...
 
-    def mark_flushed(self, ids: Sequence[int]) -> int:
-        """把给定记录标记为已提交，返回实际更新的行数。"""
+    def mark_flushed(self, ids: Sequence[int], value: int = 2) -> int:
+        """把给定记录标记为指定状态，返回实际更新的行数。"""
         ...
 
 
@@ -251,7 +251,12 @@ class HindsightSync:
         for index, batch in enumerate(batches, start=1):
             items = build_items(batch)
             try:
-                result = await self._client.retain(self._bank_id, items)
+                # 显式传 False：客户端默认已经改成异步提交，但这层还在用「200 =
+                # 已落地」的老语义。改用异步 + 对账是下一步改造的事，在那之前
+                # 必须钉住同步模式，否则 200 只代表排队，这里却会误标成已完成。
+                result = await self._client.retain(
+                    self._bank_id, items, is_async=False
+                )
             except HindsightError as exc:
                 awaited = f"第 {index}/{len(batches)} 批"
                 self._log.error(f"Hindsight 提交失败（{awaited}）：{exc}")

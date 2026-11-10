@@ -15,9 +15,17 @@ from urllib.parse import quote
 
 import httpx
 
-# 写入/召回默认超时。Hindsight 的抽取是异步的，HTTP 层通常很快返回，
-# 30 秒足够覆盖一次较慢的 LLM 排队；真正需要长超时的是少数场景。
+# 写入/召回默认超时。
+#
+# 同一台机器上实测：一次同步 retain（3 行中文对话）从提交到抽取完成要 86 秒，
+# 远远超过 HTTP 客户端的合理等待时间；而召回必须在几秒内返回，慢了就会拖住
+# 用户这一轮对话。所以两组超时必须分开：
+#   - 写入走异步模式（async=True），HTTP 只负责排队，很快返回；
+#   - 同步写入只用于手工诊断，给一个宽松值；
+#   - 召回用短超时，宁可这轮不带记忆，也不要让用户干等。
 DEFAULT_TIMEOUT = 30.0
+RETAIN_TIMEOUT = 120.0
+RECALL_TIMEOUT = 10.0
 
 
 class HindsightError(Exception):
@@ -61,7 +69,22 @@ class HindsightBankNotFoundError(HindsightRequestError):
 
     Note:
         客户端里所有业务路径都挂在 bank 下，因此这里把 404 一律当作
-        「库不存在」。将来若加入按 memory_id 查询的接口，需要重新区分。
+        「库不存在」。需要区分「操作不存在」时用
+        ``HindsightOperationNotFoundError``。
+    """
+
+
+class HindsightOperationNotFoundError(HindsightRequestError):
+    """要查询/重试的操作不存在（HTTP 404）。
+
+    与 ``HindsightBankNotFoundError`` 同为 404，但补救方式不同：库不存在可以
+    建，操作不存在只说明服务端已经把它清理掉了，本地只能放弃这条路径、
+    回退成重新投递原始内容。
+
+    Note:
+        服务端的 operations 接口对不存在的 id 也可能返回 200 且
+        ``status="not_found"``，因此调用方除了捕获本异常，还要检查响应里的
+        ``status``。
     """
 
 
@@ -71,14 +94,17 @@ class HindsightServerError(HindsightError):
 
 @dataclass(frozen=True)
 class RetainResult:
-    """一次 retain 的同步响应。
+    """一次 retain 的响应。
 
     Attributes:
         success: 服务端是否报告无错完成。
         bank_id: 接收内容的记忆库。
         items_count: 处理的 item 数量。
-        is_async: 是否异步处理。Hindsight 的抽取通常是异步的，
-            为 True 意味着 HTTP 200 只代表请求被接受，事实尚未落地。
+        is_async: 是否异步处理。True 意味着 HTTP 200 只代表请求被接受，
+            事实尚未落地，必须再拿 ``operation_id`` 去查进度。
+        operation_id: 异步操作的标识。仅 ``is_async`` 为 True 时存在。
+            服务端会原样回显客户端提供的 id（实测确认），因此调用方可以
+            用自己生成的 UUID 作为幂等键。
         usage: LLM token 用量，仅同步执行时才有；无则返回空字典。
     """
 
@@ -86,6 +112,7 @@ class RetainResult:
     bank_id: str
     items_count: int
     is_async: bool
+    operation_id: str = ""
     usage: dict[str, int] = field(default_factory=dict)
 
 
@@ -173,6 +200,10 @@ class HindsightClient:
         self,
         bank_id: str,
         items: list[dict],
+        *,
+        is_async: bool = True,
+        operation_id: str | None = None,
+        timeout: float | None = None,
     ) -> RetainResult:
         """写入一批内容。
 
@@ -181,6 +212,14 @@ class HindsightClient:
             items: ``MemoryItem`` 字典列表，每项至少要有 ``content``。
                 若要追加到已有文档，需同时给 ``document_id`` 与
                 ``update_mode="append"``（Hindsight 的硬性要求）。
+            is_async: 是否异步提交。默认 True：HTTP 只负责排队，抽取在服务端
+                后台进行。同步模式实测要 80 秒以上，HTTP 客户端等不起。
+            operation_id: 异步操作的标识，由调用方生成。服务端会原样回显，
+                并且它是幂等键——用同一个 id 重发不会产生第二份内容，所以
+                提交超时后可以直接重发，不必先确认上一次成没成。
+                同步模式下会被服务端忽略。
+            timeout: 覆盖本次请求的超时（秒）。异步提交通常几秒内返回，
+                同步提交需要传一个宽松值。
 
         Returns:
             解析后的 ``RetainResult``。
@@ -196,13 +235,26 @@ class HindsightClient:
             # 避免把"没有新内容可提交"误报成故障。
             raise ValueError("items 不能为空：没有待提交的内容时不要调用 retain")
 
-        payload = {"items": items}
-        data = await self._post(f"/v1/default/banks/{_quote_bank(bank_id)}/memories", payload)
+        payload = _drop_none(
+            {
+                "items": items,
+                "async": is_async,
+                "operation_id": operation_id,
+            }
+        )
+        path = f"/v1/default/banks/{_quote_bank(bank_id)}/memories"
+        data = await self._request(
+            "POST", path, json=payload, timeout=timeout if timeout is not None else self._timeout
+        )
         return RetainResult(
             success=bool(data.get("success", False)),
             bank_id=str(data.get("bank_id", bank_id)),
             items_count=int(data.get("items_count", 0)),
             is_async=bool(data.get("async", False)),
+            # 响应里可能给 operation_id（单个）或 operation_ids（数组，
+            # 当 items 用了不同策略分组时）。取第一个即可：同一批的其余
+            # 操作共用同一个本地批次记录，对账时以父 id 为准。
+            operation_id=_first_operation_id(data),
             usage=dict(data.get("usage") or {}),
         )
 
@@ -219,6 +271,7 @@ class HindsightClient:
         include_entities: bool | None = None,
         tags: list[str] | None = None,
         tags_match: str | None = None,
+        timeout: float | None = None,
     ) -> dict:
         """按自然语言查询召回记忆。
 
@@ -234,6 +287,8 @@ class HindsightClient:
             include_entities: 是否附带实体信息。
             tags: 按可见性标签过滤。
             tags_match: 标签匹配方式 ``any`` / ``all`` / ``exact``。
+            timeout: 覆盖本次请求的超时（秒）。召回会在用户每句话之前执行，
+                慢了就会拖住对话，所以默认用较短的 ``RECALL_TIMEOUT``。
 
         Returns:
             服务端原始响应（含 ``results`` 等字段）。
@@ -257,8 +312,11 @@ class HindsightClient:
                 "tags_match": tags_match,
             }
         )
-        return await self._post(
-            f"/v1/default/banks/{_quote_bank(bank_id)}/memories/recall", payload
+        return await self._request(
+            "POST",
+            f"/v1/default/banks/{_quote_bank(bank_id)}/memories/recall",
+            json=payload,
+            timeout=timeout if timeout is not None else RECALL_TIMEOUT,
         )
 
     async def reflect(
@@ -350,6 +408,95 @@ class HindsightClient:
         )
         return True
 
+    async def list_operations(
+        self,
+        bank_id: str,
+        *,
+        status: str | None = None,
+        type_: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+        exclude_parents: bool = False,
+    ) -> dict:
+        """列出记忆库的操作记录。
+
+        一次能拿回一整页，比逐个 ``get_operation`` 省掉 N 次往返——巡检时
+        本地可能积压了几十条待确认的批次，逐条查会明显拖慢一轮同步。
+
+        Args:
+            bank_id: 记忆库标识。
+            status: 只列这个状态：``pending`` / ``processing`` / ``completed``
+                / ``failed`` / ``cancelled``。省略则全列。
+            type_: 只列这个类型：``retain`` / ``batch_retain`` /
+                ``consolidation`` / ``refresh_mental_model`` /
+                ``file_convert_retain`` / ``webhook_delivery``。
+            limit: 返回条数上限，服务端上限是 100。
+            offset: 分页偏移。
+            exclude_parents: 是否排除父操作。父操作（type=batch_retain）只是
+                一组子操作的壳，它的状态跟随子操作，通常不需要单独看。
+
+        Returns:
+            服务端原始响应（``bank_id`` / ``total`` / ``limit`` /
+            ``offset`` / ``operations``）。
+        """
+        params = _drop_none(
+            {
+                "status": status,
+                "type": type_,
+                "limit": limit,
+                "offset": offset or None,
+                "exclude_parents": True if exclude_parents else None,
+            }
+        )
+        return await self._get(
+            f"/v1/default/banks/{_quote_bank(bank_id)}/operations", params=params
+        )
+
+    async def get_operation(self, bank_id: str, operation_id: str) -> dict:
+        """查询单个操作的当前状态。
+
+        Args:
+            bank_id: 记忆库标识。
+            operation_id: 操作标识（``retain`` 响应里返回的那个）。
+
+        Returns:
+            服务端原始响应，关键字段是 ``status``（``pending`` /
+            ``processing`` / ``completed`` / ``failed`` / ``cancelled`` /
+            ``not_found``）与 ``error_message``。
+        """
+        wanted = (operation_id or "").strip()
+        if not wanted:
+            raise ValueError("operation_id 不能为空")
+        return await self._get(
+            f"/v1/default/banks/{_quote_bank(bank_id)}/operations/{quote(wanted, safe='')}"
+        )
+
+    async def retry_operation(self, bank_id: str, operation_id: str) -> dict:
+        """让服务端重新执行一个失败的操作。
+
+        这是「失败后首选的重试方式」：服务端用它已经收到的原文重跑抽取，
+        不会在文档末尾重复追加；而用相同内容重新 retain 会再追加一遍，
+        同一句话就进两次库。
+
+        Args:
+            bank_id: 记忆库标识。
+            operation_id: 操作标识。
+
+        Returns:
+            服务端原始响应（``success`` / ``message`` / ``operation_id``）。
+
+        Raises:
+            HindsightBankNotFoundError: 操作不存在（已被清理），此时只能
+                放弃这条路径、回退成重新投递。
+        """
+        wanted = (operation_id or "").strip()
+        if not wanted:
+            raise ValueError("operation_id 不能为空")
+        return await self._post(
+            f"/v1/default/banks/{_quote_bank(bank_id)}/operations/{quote(wanted, safe='')}/retry",
+            {},
+        )
+
     async def aclose(self) -> None:
         """关闭自建的连接池。
 
@@ -399,31 +546,38 @@ class HindsightClient:
                 按状态码分类的业务失败。
         """
         url = f"{self._base_url}{path}"
+        # 允许单次请求覆盖超时：异步提交几秒返回，同步提交要等几十秒，
+        # 召回又必须几秒内放弃，一个全局值不可能同时合适。
+        effective_timeout = kwargs.pop("timeout", None) or self._timeout
         try:
             response = await self._http.request(
-                method, url, headers=self._headers, **kwargs
+                method, url, headers=self._headers, timeout=effective_timeout, **kwargs
             )
         except httpx.TimeoutException as exc:
             raise HindsightConnectionError(
-                f"请求超时（{self._timeout:g} 秒）：{url}"
+                f"请求超时（{effective_timeout:g} 秒）：{url}"
             ) from exc
         except httpx.HTTPError as exc:
             raise HindsightConnectionError(f"无法连接 Hindsight（{url}）：{exc}") from exc
 
-        return self._parse(response, url)
+        return self._parse(response, url, path=path)
 
-    def _parse(self, response: httpx.Response, url: str) -> dict:
+    def _parse(self, response: httpx.Response, url: str, *, path: str = "") -> dict:
         """按状态码把响应翻译成返回值或异常。
 
         Args:
             response: httpx 响应对象。
             url: 完整地址，仅用于错误信息。
+            path: 请求路径。用来区分同一个 404 的两种含义：库不存在，还是
+                操作不存在——两者的补救办法完全不同。
 
         Returns:
             响应 JSON。
 
         Raises:
             HindsightAuthError: 401 / 403。
+            HindsightBankNotFoundError: 404 且路径指向记忆库。
+            HindsightOperationNotFoundError: 404 且路径指向操作。
             HindsightRequestError: 其余 4xx。
             HindsightServerError: 5xx 或非 JSON 响应。
         """
@@ -431,6 +585,10 @@ class HindsightClient:
         detail = _extract_detail(response)
 
         if status == 404:
+            if "/operations/" in path:
+                raise HindsightOperationNotFoundError(
+                    f"操作不存在（HTTP 404，可能已被服务端清理）：{detail}"
+                )
             # 业务路径全部挂在 bank 下，404 的语义就是「这个库没有」。
             raise HindsightBankNotFoundError(
                 f"记忆库不存在（HTTP 404）：{detail}"
@@ -520,6 +678,30 @@ def _drop_none(mapping: dict) -> dict:
         仅保留非 None 值的新字典。
     """
     return {key: value for key, value in mapping.items() if value is not None}
+
+
+def _first_operation_id(data: dict) -> str:
+    """从 retain 响应里取出操作标识。
+
+    服务端在 ``async=true`` 时返回 ``operation_id`` 字符串；当 items 使用了
+    不同的 per-item 策略、被拆成多组时，改用它给出 ``operation_ids`` 数组。
+    两种都兼容，取第一个即可——本项目的 items 都是同一策略，实际只会有一个。
+
+    Args:
+        data: retain 响应的 JSON。
+
+    Returns:
+        操作标识；同步模式或字段缺失时返回空串。
+    """
+    single = data.get("operation_id")
+    if isinstance(single, str) and single.strip():
+        return single.strip()
+    many = data.get("operation_ids")
+    if isinstance(many, list):
+        for item in many:
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+    return ""
 
 
 def _extract_detail(response: httpx.Response) -> str:

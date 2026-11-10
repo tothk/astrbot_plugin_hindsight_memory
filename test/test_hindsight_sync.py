@@ -184,16 +184,22 @@ class FakeClient:
         self.success = success
         self.error = error
         self.calls: list[tuple[str, list[dict]]] = []
+        # 记录每次调用用的是同步还是异步模式：这层必须钉住同步语义，
+        # 异步改造之前若被悄悄改成 True，200 就只代表「已排队」。
+        self.async_modes: list[bool] = []
 
-    async def retain(self, bank_id: str, items: list[dict]) -> RetainResult:
+    async def retain(
+        self, bank_id: str, items: list[dict], *, is_async: bool = True, **_: object
+    ) -> RetainResult:
         self.calls.append((bank_id, items))
+        self.async_modes.append(is_async)
         if self.error is not None:
             raise self.error
         return RetainResult(
             success=self.success,
             bank_id=bank_id,
             items_count=len(items),
-            is_async=False,
+            is_async=is_async,
             usage={},
         )
 
