@@ -18,8 +18,35 @@ from astrbot_plugin_hindsight_memory.db.models.models import RawMessage
 from astrbot_plugin_hindsight_memory.hindsight.plugin_config import (
     DEFAULT_BANK_ID,
     HindsightConfig,
+    clean_nickname,
 )
 from astrbot_plugin_hindsight_memory.hindsight.sync import SyncOutcome, speaker_of
+
+
+def _user_raw(*, sender_id: str = "10001", sender_name: str = "") -> RawMessage:
+    return RawMessage(
+        record_date="2026-11-10",
+        document_id="d",
+        sender_id=sender_id,
+        sender_name=sender_name,
+        persona_id="",
+        role="user",
+        raw_message="今天好累",
+        message_sent_time="2026-11-10T23:50:00+08:00",
+    )
+
+
+def _llm_raw(*, sender_id: str = "bot", sender_name: str = "") -> RawMessage:
+    return RawMessage(
+        record_date="2026-11-10",
+        document_id="d",
+        sender_id=sender_id,
+        sender_name=sender_name,
+        persona_id="default",
+        role="llm",
+        raw_message="那就早点休息",
+        message_sent_time="2026-11-10T23:51:00+08:00",
+    )
 
 
 class TestHindsightConfigFromMapping:
@@ -69,6 +96,20 @@ class TestHindsightConfigFromMapping:
         assert config.host == "localhost"
         assert config.bank_id == DEFAULT_BANK_ID
         assert config.daily_time == "00:05"
+
+    def test_nicknames_default_to_empty(self):
+        config = HindsightConfig.from_mapping({})
+
+        assert config.user_nickname == ""
+        assert config.llm_nickname == ""
+
+    def test_nicknames_are_read_and_cleaned(self):
+        config = HindsightConfig.from_mapping(
+            {"user_nickname": "  小\n满  ", "llm_nickname": "小满的AI"}
+        )
+
+        assert config.user_nickname == "小 满"
+        assert config.llm_nickname == "小满的AI"
 
     def test_non_numeric_port_falls_back(self):
         config = HindsightConfig.from_mapping({"hindsight_port": "abc"})
@@ -257,6 +298,62 @@ class TestSpeakerOf:
         )
 
         assert speaker_of(raw) == "10001"
+
+    def test_configured_user_name_wins(self):
+        raw = _user_raw(sender_name="A165F5ED796689E7CF11392EB290C0E9")
+
+        assert speaker_of(raw, user_name="小满") == "小满"
+
+    def test_configured_bot_name_wins_for_llm_rows(self):
+        raw = _llm_raw(sender_name="助手")
+
+        assert speaker_of(raw, bot_name="小满的AI") == "小满的AI"
+
+    def test_user_name_does_not_apply_to_llm_rows(self):
+        # 配错了称呼不该串到对方身上：AI 那一行必须还用 AI 的称呼。
+        raw = _llm_raw(sender_name="助手")
+
+        assert speaker_of(raw, user_name="小满") == "助手"
+
+    def test_bot_name_does_not_apply_to_user_rows(self):
+        raw = _user_raw(sender_name="小满")
+
+        assert speaker_of(raw, bot_name="小满的AI") == "小满"
+
+    def test_blank_configured_name_falls_back_to_record(self):
+        raw = _user_raw(sender_name="小满")
+
+        assert speaker_of(raw, user_name="   ") == "小满"
+
+    def test_configured_name_survives_missing_sender_name(self):
+        # 这正是配置要救的情况：平台只给了哈希 id，昵称拿不到。
+        raw = _user_raw(
+            sender_id="A165F5ED796689E7CF11392EB290C0E9", sender_name=""
+        )
+
+        assert speaker_of(raw, user_name="小满") == "小满"
+
+
+class TestCleanNickname:
+    def test_strips_newlines(self):
+        # 换行必须去掉：会被 Hindsight 当作行分隔，其后那行没有说话人。
+        assert clean_nickname("小\n满") == "小 满"
+
+    def test_strips_crlf(self):
+        assert clean_nickname("小\r\n满") == "小 满"
+
+    def test_collapses_runs_of_whitespace(self):
+        assert clean_nickname("  小 \t 满  ") == "小 满"
+
+    def test_keeps_parentheses(self):
+        # 括号只影响观感，不影响 Name (time): text 的解析，允许保留。
+        assert clean_nickname("小满(AI)") == "小满(AI)"
+
+    def test_none_becomes_empty(self):
+        assert clean_nickname(None) == ""
+
+    def test_non_string_is_coerced(self):
+        assert clean_nickname(123) == "123"
 
 
 class TestFormatSyncResult:

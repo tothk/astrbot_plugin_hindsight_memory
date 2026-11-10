@@ -107,6 +107,8 @@ class MemoryService:
             bank_id=config.bank_id,
             max_chars=config.batch_chars,
             log=log,
+            user_name=config.user_nickname,
+            bot_name=config.llm_nickname,
         )
         self._daily = parse_daily_time(self._config.daily_time)
         self._task: asyncio.Task | None = None
@@ -121,9 +123,14 @@ class MemoryService:
         if self._task is not None:
             return
         self._task = asyncio.create_task(self._daily_loop())
+        # 把两个称呼也打出来：它们会写进 Hindsight 的对话文本，配错了只有从
+        # 抽取出的事实里才看得出来，启动日志是最省事的核对点。
+        user_name = self._config.user_nickname or "（沿用记录值）"
+        bot_name = self._config.llm_nickname or "（沿用记录值）"
         self._log.info(
             f"Hindsight 记忆服务已启动：{self._client.base_url} "
-            f"bank={self._config.bank_id} 每批≤{self._config.batch_chars} 字"
+            f"bank={self._config.bank_id} 每批≤{self._config.batch_chars} 字 "
+            f"称呼：用户={user_name} / AI={bot_name}"
             f"{'（已配置 Token）' if self._client.token_present else '（未配置 Token）'}"
         )
 

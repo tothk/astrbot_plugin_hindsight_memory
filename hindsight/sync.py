@@ -39,29 +39,49 @@ _LINE_SEPARATOR = "\n"
 MAX_ATTEMPTS = 3
 
 
-def speaker_of(raw: RawMessage) -> str:
+def speaker_of(
+    raw: RawMessage, *, user_name: str = "", bot_name: str = ""
+) -> str:
     """取这条记录在对话文本里的说话人标识。
 
-    优先用昵称而不是 ``sender_id``：Hindsight 会把 ``Name (time): text`` 里的
-    Name 解析成实体，数字 ID（QQ 号）解析出来只是 "user"，此后「她喜欢看海」
+    三层优先级：配置的固定称呼 → 数据库记录的昵称 → ``sender_id``。
+
+    为什么优先用昵称而不是 ``sender_id``：Hindsight 会把 ``Name (time): text``
+    里的 Name 解析成实体，数字 ID（QQ 号）解析出来只是 "user"，此后「她喜欢看海」
     这类人格化事实就挂不到具体的人身上，召回时也匹配不到。实测同一段中文对话，
     用 "Alice" 能提取出 ``Involving: Alice``，用 "10001" 只能得到 ``Involving: user``。
 
+    为什么还要在配置里再给一层：有些平台给的 ``sender_id`` 是一长串哈希
+    （QQ 官方机器人就是 ``A165F5ED...`` 这种 openid），昵称也可能拿不到，
+    于是实体名退化成一串乱码。配置层能稳定补救这种情况。
+
+    为什么配置放在最外层而不是记录阶段：数据库里的昵称是这里的第二层，
+    若在记录时就把配置值写进库，第二层就永远用不上，历史数据也改不了。
+
     Args:
         raw: 待渲染的记录。
+        user_name: 配置里的用户固定称呼，空串表示不覆盖。
+        bot_name: 配置里的 AI 固定称呼，空串表示不覆盖。
 
     Returns:
-        昵称；昵称为空时退回 ``sender_id``（至少不会丢掉"有个人说过话"）。
+        说话人标识；配置与昵称都为空时退回 ``sender_id``。
     """
-    name = (raw.sender_name or "").strip()
-    return name or raw.sender_id
+    override = user_name if raw.role == "user" else bot_name
+    name = (override or "").strip()
+    if name:
+        return name
+    return (raw.sender_name or "").strip() or raw.sender_id
 
 
-def render_line(raw: RawMessage) -> str:
+def render_line(
+    raw: RawMessage, *, user_name: str = "", bot_name: str = ""
+) -> str:
     """把一条记录渲染成对话文本里的一行。
 
     Args:
         raw: 待提交的原始记录。
+        user_name: 配置里的用户固定称呼，空串表示沿用记录值。
+        bot_name: 配置里的 AI 固定称呼，空串表示沿用人格名。
 
     Returns:
         形如 ``"小明 (2026-11-10T10:30:05+08:00): 今天有点累"`` 的单行文本。
@@ -75,12 +95,17 @@ def render_line(raw: RawMessage) -> str:
     # splitlines() 而不是 replace("\n", " ")：Windows 的 \r\n 与旧 Mac 的 \r
     # 都能一并处理，顺带丢掉空行与每行首尾的空白。
     text = " ".join(part.strip() for part in raw.raw_message.splitlines() if part.strip())
-    prefix = f"{speaker_of(raw)} ({raw.message_sent_time}):"
+    speaker = speaker_of(raw, user_name=user_name, bot_name=bot_name)
+    prefix = f"{speaker} ({raw.message_sent_time}):"
     return f"{prefix} {text}" if text else prefix
 
 
 def split_batches(
-    messages: Sequence[RawMessage], max_chars: int
+    messages: Sequence[RawMessage],
+    max_chars: int,
+    *,
+    user_name: str = "",
+    bot_name: str = "",
 ) -> list[list[RawMessage]]:
     """按字符上限把记录切成若干批。
 
@@ -90,6 +115,8 @@ def split_batches(
     Args:
         messages: 按 id 升序排列的待提交记录。
         max_chars: 单批的字符上限，通常是配置项 ``sync_batch_chars``。
+        user_name: 配置里的用户固定称呼，空串表示沿用记录值。
+        bot_name: 配置里的 AI 固定称呼，空串表示沿用人格名。
 
     Returns:
         按原顺序切好的批次列表；输入为空时返回空列表。
@@ -100,6 +127,10 @@ def split_batches(
     Note:
         单条本身就超过上限时不会死循环：批为空时不封批，这条会被单独放进一批
         （随后下一条到来时触发封批）。否则「空批永远装不下」会让同步永久卡死。
+
+        两个称呼参数不是为了渲染，而是为了算准宽度：配置的称呼与数据库里的
+        昵称长度不同，若这里用一种名字量、到 ``build_items`` 再换另一种，
+        实际提交的正文可能超过上限。
     """
     if max_chars <= 0:
         raise ValueError(f"max_chars 必须是正数，收到 {max_chars}")
@@ -110,7 +141,7 @@ def split_batches(
 
     for raw in messages:
         # +1 是这一行与上一行之间那个换行符的宽度。
-        width = len(render_line(raw)) + 1
+        width = len(render_line(raw, user_name=user_name, bot_name=bot_name)) + 1
         if current and current_chars + width > max_chars:
             batches.append(current)
             current = []
@@ -123,7 +154,9 @@ def split_batches(
     return batches
 
 
-def build_items(batch: Sequence[RawMessage]) -> list[dict]:
+def build_items(
+    batch: Sequence[RawMessage], *, user_name: str = "", bot_name: str = ""
+) -> list[dict]:
     """把一批记录装配成 retain 接口的 ``items``。
 
     一批可能跨多个 ``document_id``（用户已确认允许）：批次只按字符数切分，
@@ -133,6 +166,8 @@ def build_items(batch: Sequence[RawMessage]) -> list[dict]:
 
     Args:
         batch: 同一批次内的记录，需保持时间顺序。
+        user_name: 配置里的用户固定称呼，空串表示沿用记录值。
+        bot_name: 配置里的 AI 固定称呼，空串表示沿用人格名。
 
     Returns:
         ``MemoryItem`` 字典列表，每个元素对应一个文档。
@@ -149,7 +184,9 @@ def build_items(batch: Sequence[RawMessage]) -> list[dict]:
 
     for raw in batch:
         document_id = raw.document_id
-        lines_by_doc.setdefault(document_id, []).append(render_line(raw))
+        lines_by_doc.setdefault(document_id, []).append(
+            render_line(raw, user_name=user_name, bot_name=bot_name)
+        )
         # setdefault 保证只记录第一次出现的时间，即该文档内最早的那条。
         first_time_by_doc.setdefault(document_id, raw.message_sent_time)
 
@@ -266,6 +303,8 @@ class HindsightSync:
         bank_id: str,
         max_chars: int,
         log,
+        user_name: str = "",
+        bot_name: str = "",
     ) -> None:
         """初始化。
 
@@ -275,12 +314,16 @@ class HindsightSync:
             bank_id: 记忆库标识。
             max_chars: 单批字符上限，对应配置项 ``sync_batch_chars``。
             log: 日志对象，需提供 info/warning/error/debug。
+            user_name: 配置里的用户固定称呼，空串表示沿用记录值。
+            bot_name: 配置里的 AI 固定称呼，空串表示沿用人格名。
         """
         self._store = store
         self._client = client
         self._bank_id = bank_id
         self._max_chars = max_chars
         self._log = log
+        self._user_name = user_name
+        self._bot_name = bot_name
 
     async def run(self, *, limit: int = 1000) -> SyncOutcome:
         """执行一轮同步：先对账，再投递。
@@ -466,7 +509,9 @@ class HindsightSync:
         flushed = 0
 
         for index, batch in enumerate(batches, start=1):
-            items = build_items(batch)
+            items = build_items(
+                batch, user_name=self._user_name, bot_name=self._bot_name
+            )
             ids = [raw.id for raw in batch if raw.id is not None]
             awaited = f"第 {index}/{len(batches)} 批"
 

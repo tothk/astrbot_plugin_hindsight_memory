@@ -28,7 +28,7 @@
     "description": "记忆库标识（bank_id）",
     "hint": "写入与召回都使用这个记忆库。服务端若已有数据，请填写与之相同的名字，否则会对着一片空库召回。默认 default。",
     "type": "string",
-    "default": "default"
+    "default": "01a1c652-f619-77c9-87ab-ad9d71a5c910"
   },
   "sync_batch_chars": {
     "description": "单批提交字符上限",
@@ -57,5 +57,17 @@
       "step": 1
     },
     "default": 5
+  },
+  "user_nickname": {
+    "description": "记忆中「用户」的称呼",
+    "hint": "写进记忆时用这个称呼代替真实昵称，适合真实昵称取不到、或平台给的是哈希 id 的情况。留空则沿用数据库里记录的昵称。不要填写换行。",
+    "type": "string",
+    "default": ""
+  },
+  "llm_nickname": {
+    "description": "记忆中「AI」的称呼",
+    "hint": "写进记忆时用这个称呼代替人格名。留空则沿用人格名（取不到时是「助手」）。不要填写换行。",
+    "type": "string",
+    "default": ""
   }
 }

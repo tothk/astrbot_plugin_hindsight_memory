@@ -45,6 +45,24 @@ def _as_int(value, default: int, *, minimum: int, maximum: int) -> int:
     return max(minimum, min(maximum, number))
 
 
+def clean_nickname(value: object) -> str:
+    """清洗一个自定义称呼：压掉换行与连续空白。
+
+    换行必须清掉，这不是洁癖：Hindsight 把提交的正文按行解析成
+    ``Name (timestamp): text``，称呼里一旦含换行，它后面那一行就没有说话人，
+    整篇文档的归属都会错位——这比丢几个空格严重得多。
+
+    Args:
+        value: 配置里的原始值，可能是 None、数字或带空白的字符串。
+
+    Returns:
+        折成单行的字符串；清洗后为空则返回空串（调用方据此回退到数据库值）。
+    """
+    # 不用 replace("\n", " ")：split() 无参数时按任意空白切分，\r\n、制表符、
+    # 全角空格都能一并处理，顺带把「连续多个空格」归一成一个。
+    return " ".join(str(value or "").split())
+
+
 @dataclass(frozen=True)
 class HindsightConfig:
     """插件运行时需要的全部外部配置。
@@ -57,6 +75,8 @@ class HindsightConfig:
         bank_id: 记忆库标识。
         recall_quantity: 每次对话注入上下文的记忆条数。
         daily_time: 每日补投时刻，``HH:MM`` 形式。
+        user_nickname: 写入记忆时代表用户的固定称呼，空串表示沿用记录值。
+        llm_nickname: 写入记忆时代表 AI 的固定称呼，空串表示沿用人格名。
     """
 
     host: str = _DEFAULT_HOST
@@ -66,6 +86,8 @@ class HindsightConfig:
     bank_id: str = DEFAULT_BANK_ID
     recall_quantity: int = _DEFAULT_RECALL_QUANTITY
     daily_time: str = _DEFAULT_DAILY_TIME
+    user_nickname: str = ""
+    llm_nickname: str = ""
 
     @classmethod
     def from_mapping(cls, config: Mapping | None) -> "HindsightConfig":
@@ -102,4 +124,6 @@ class HindsightConfig:
             ),
             daily_time=str(data.get("sync_daily_time") or _DEFAULT_DAILY_TIME).strip()
             or _DEFAULT_DAILY_TIME,
+            user_nickname=clean_nickname(data.get("user_nickname")),
+            llm_nickname=clean_nickname(data.get("llm_nickname")),
         )
