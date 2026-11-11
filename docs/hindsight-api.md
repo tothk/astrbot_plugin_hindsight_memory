@@ -361,7 +361,7 @@ schema 规则：必须是对象且至少一个属性；属性类型限 `string`/
 
 ## 8. 本项目（AstrBot 插件）如何对接
 
-结合已定的写入策略（每 5000 字符一批、每日 00:05 补投、同 `document_id` 追加、接受重复），落地要点如下。
+结合已定的写入策略（每 `sync_batch_chars` 字符一批、积压达阈值自动投、每日 00:05 补投、`/hindsight_sync` 手动投、同 `document_id` 追加），落地要点如下。
 
 ### 8.1 关键结论：不要自己拼 JSON Lines
 
@@ -376,28 +376,62 @@ schema 规则：必须是对象且至少一个属性；属性类型限 `string`/
 
 ### 8.2 请求骨架
 
+本地 `build_items()` 实际发出的 item 只有四个字段：
+
 ```python
 items = [{
     "content": "\n".join(lines),          # 逐行 "{sender} ({time}): {text}"
-    "context": "陪伴型 AI 私聊对话",        # 固定短语，显著影响抽取质量
-    "document_id": document_id,           # 与本地 rawmessagesqlite.document_id 对齐
+    "document_id": document_id,           # 与本地 rawmessage.document_id 对齐，格式 `日期:umo`
     "update_mode": "append",              # 同一 document_id 后续提交即追加
-    "timestamp": latest_time,             # 本批最后一条的发生时间
-    "metadata": {"umo": umo, "role_scope": "private"},
+    "timestamp": day_start,               # 当天零点，见下
 }]
 ```
 
-`update_mode="append"` 有硬性前提：**必须带 `document_id`**，且该 bank 内该文档此前存在过。第一次提交时可以也用 `append`（没有旧文档时行为等同新建）。
+可选但本项目未用的两个字段：
+
+- `context`：一句固定短语（如「陪伴型 AI 私聊对话」），会拼进抽取用的 prompt，对质量有影响；
+- `metadata`：字符串键值对，值必须是 `str`，`null` 会被丢弃。
+
+`update_mode="append"` 有硬性前提：**必须带 `document_id`**，且该 bank 内该文档此前存在过。第一次提交也可以直接用 `append`（没有旧文档时行为等同新建）。
+
+**`timestamp` 为什么是「当天零点」而不是「本批第一条/最后一条的时间」**：服务端每次 append 都会用新提交的 `timestamp` 覆盖文档级的 `event_date`（实测：先提交 `01:00` 再提交 `00:00`，文档最终变成 `00:00`）。按批次算的话，同一天追加几次文档时间就漂几次，停在哪取决于最后一次提交的运气。取零点则每次算出的值恒等，覆盖无害，语义也正好对上 `document_id` 的「一天」边界。
+
+行内时间不受影响——每行 `"{sender} ({time}): {text}"` 里的 `time` 仍然是这一条的真实发生时刻。**文档级时间管「哪一天」，行内时间管「哪一刻」。**
 
 ### 8.3 分批规则（与本地实现对齐）
 
 - 按字符数累计到 `sync_batch_chars`（默认 5000）就切一批；若某一条自身就超过上限且当前批为空，**单独成批提交**，否则会永久阻塞。
 - 分批允许跨 `document_id`（追加语义下无妨），但每批内仍要保证 `document_id` → 内容行的映射正确：一个 `items` 数组里可以放多个 item，每个 item 各自带自己的 `document_id`。**不要**把两个 `document_id` 的内容混进同一个 item 的 `content`。
-- 提交成功后（HTTP 200 且 `success: true`）再标记本地 `flushed = 1`。接受「成功但未标记就崩溃」导致的重复——Hindsight 侧是追加，重复内容会产生冗余事实但不致命。
+- **提交是异步的**（`async: true`）。同步 retain 实测要 80～100 秒，HTTP 客户端等不起，插件更不该把事件循环挂在那里。
 
-### 8.4 每日 00:05 补投
+### 8.4 投递状态机与对账
 
-定时任务扫描 `flushed = 0` 的记录，如果为空就什么都不做（不要发空 `items` 数组，那会返回 422）。补投失败要记日志，且**不要**把 `flushed` 置位。
+`flushed` 有三个状态，不是两个：
+
+| 值 | 含义 |
+|---|---|
+| `0` | 待投递：还没入队过 |
+| `1` | 已入队：本地记下了 `operation_id`，等服务端确认 |
+| `2` | 已完成：对账查到 operation `completed`，行记录被标记 |
+
+顺序必须是**先落库凭据、再发请求**：
+
+```python
+operation_id = str(uuid.uuid4())
+store.mark_enqueued(ids, operation_id=operation_id)   # 先落库
+await client.retain(bank_id, items, is_async=True, operation_id=operation_id)
+```
+
+反过来（先提交、拿到 id 再落库）会留下一个窗口：服务端已排队、本地没凭据，进程一崩这批就停在待投递，下一轮换个新 uuid 重投，文档里多一份。
+
+反过来的代价是「本地记了、服务端没收到」，这靠对账解决——提交时用的就是本地记下的那个 id，所以 404 只能意味着服务端从没收到过：
+
+- 查到 `completed` → 行记录标 `2`，删掉批次凭据；
+- 查到 `failed`/`cancelled` → **先调 `POST .../operations/{id}/retry`**，不要重投。`append` 语义下重投会把同一段内容在文档末尾再追加一遍；
+- 累计 3 次仍失败 → 退回 `flushed=0`（宁可文档末尾重复一遍，也不能让记录永远卡在中间态）；
+- 404 → 退回 `flushed=0`，下一轮用新 id 重投。
+
+对账不能只靠「下次投新内容时顺便查」：用户三天不说话就没有「下次」，失败批次会永远停在 `flushed=1`。所以每日 00:05 的定时任务要跑完整的 `reconcile() + submit()`。
 
 ### 8.5 记忆库不存在时要主动创建
 
@@ -428,13 +462,14 @@ except HindsightBankNotFoundError:          # 404 单独成一个异常类型
 
 ### 8.6 本项目的字段映射
 
-| 本地 `rawmessagesqlite` | Hindsight |
+| 本地 `rawmessage` | Hindsight |
 |---|---|
-| `raw_message` | `content` 里每行的正文部分 |
-| `sender_name`（为空时退回 `sender_id`） | 每行的说话人前缀（`Name` 位置）。**必须用昵称**：传 `10001` 这类数字串时，Hindsight 抽出的实体名会退化成 `user`，人格化事实（「她喜欢看海」）就建立不起来 |
-| `message_sent_time` | 每行括号内的 `timestamp`，同时作为 item 的 `timestamp`（取文档内第一条） |
-| `role` | 用于区分说话人显示名（`user` → 用户昵称，`llm` → bot 人格名） || `document_id` | 原样作为 `document_id`（本项目格式 `日期:umo`） |
-| `record_date` | 不传（已隐含在 `document_id` 里），或塞进 `metadata` |
+| `raw_message` | `content` 里每行的正文部分（换行被压平成空格） |
+| `sender_name`（为空时退回 `sender_id`，配置项可再覆盖一层） | 每行的说话人前缀（`Name` 位置）。**必须用昵称**：传 `10001` 这类数字串时，Hindsight 抽出的实体名会退化成 `user`，人格化事实（「她喜欢看海」）就建立不起来。名称里的换行要折叠、冒号要去掉，否则能被伪造成多一行对话 |
+| `role` | 只用于决定取哪个称呼（`user` → 用户昵称，`llm` → bot 人格名），不进正文 |
+| `message_sent_time` | 每行括号内的时间。**不是** item 的 `timestamp` |
+| `document_id` | 原样作为 `document_id`（本项目格式 `日期:umo`） |
+| `record_date` | 派生出 item 的 `timestamp`：`{record_date}T00:00:00{时区}`。用 `record_date` 而不是 `message_sent_time[:10]`，因为前者写入时已按本机时区算好、与 `document_id` 同源 |
 
 ---
 

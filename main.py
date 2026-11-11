@@ -4,6 +4,7 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
 from astrbot.api.event import MessageChain
 from astrbot.api.message_components import Plain
+from astrbot.core.agent.message import TextPart
 from astrbot.core.provider.entities import LLMResponse, ProviderRequest
 from astrbot.core.platform import MessageType
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -106,14 +107,14 @@ class MyPlugin(Star):
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
-        """把召回的记忆拼进系统提示。
+        """把召回的记忆挂到本轮用户消息上。
 
         走 on_llm_request 而不是 on_llm_response：记忆必须在请求发出**之前**
         进入上下文，否则这一轮的回答用不上它。
 
         Args:
             event: 当前消息事件。
-            req: 即将发给模型的请求，system_prompt 可在此修改。
+            req: 即将发给模型的请求，``extra_user_content_parts`` 可在此追加。
         """
         # 群聊一律不注入：本插件只服务一对一陪伴场景，且群聊里混入他人记忆
         # 是隐私事故。
@@ -125,10 +126,16 @@ class MyPlugin(Star):
         memory = await self._memory.recall_for(text)
         if not memory:
             return
-        # 追加到系统提示末尾而不是覆盖：宿主拼好的设定（人格、工具说明）必须保留。
-        # 必须 `or ""`：没有设置人格时 system_prompt 是 None，直接插值会让模型
-        # 收到字面量 "None" 作为系统提示的第一行。
-        req.system_prompt = f"{req.system_prompt or ''}\n\n{memory}".strip()
+        # 挂在用户消息里而不是改 system_prompt：
+        # 1. 缓存。system_prompt 是发给模型的第 0 条消息（见
+        #    tool_loop_agent_runner 里 `messages.insert(0, ...)`），而召回内容
+        #    每轮都不同——一改第 0 条，前面所有历史的前缀缓存全部作废。
+        #    挂在最后一条用户消息上，历史部分仍能命中缓存。
+        # 2. 语义。记忆是「这次对话需要的背景」，不是「你是谁」的设定，
+        #    放用户消息里更贴合它在上下文中的角色。
+        # mark_as_temp()：只在本次请求里带给模型，不写进会话历史。不加它，
+        # 每轮召回的片段会被 _save_to_history 累积进 history，越滚越大。
+        req.extra_user_content_parts.append(TextPart(text=memory).mark_as_temp())
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):

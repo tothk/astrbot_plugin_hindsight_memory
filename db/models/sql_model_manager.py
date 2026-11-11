@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 # 访问 row.raw_message 会报 AttributeError。
 from sqlmodel import Session, SQLModel, create_engine, select
 from ...config.plugin_paths import PluginPaths
+from ..migrations import run_migrations
 from .models import (
     FLUSHED_DONE,
     FLUSHED_ENQUEUED,
@@ -49,10 +50,15 @@ class SqlModelManager:
             # 会一直保持历史峰值。这条让它在搬完后截断到 1MB 以内。
             cur.execute("PRAGMA journal_size_limit=1048576")
             cur.close()
+        # 结构升级必须排在 create_all 之前：老库要先按版本链爬上来，
+        # create_all 才不会用它那套「只建不补」的逻辑把老表晾在那儿。
+        run_migrations(self._engine, log=self._log)
         PBaseModel.metadata.create_all(self._engine)
         # create_all 只建新表，不会给已存在的表补列。开发期表结构改过几次，
         # 用户的库里可能少了后来加的列（例如 sender_name），届时任何查询都会
         # 报 "no such column"。这里做一次最小的补齐，不改类型、不删列。
+        # 注意：迁移链只处理「有版本号变化」的库，版本号已经是当前值但结构
+        # 落后（版本化之前手工改过表）的库仍由这里兜底。
         self._ensure_columns()
         # 实测期间最常需要确认的就是"库到底落在哪"，启动时打一次即可。
         if self._log is not None:

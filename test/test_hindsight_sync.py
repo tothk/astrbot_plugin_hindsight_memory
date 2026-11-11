@@ -19,6 +19,7 @@ from astrbot_plugin_hindsight_memory.hindsight.sync import (
     MAX_ATTEMPTS,
     HindsightSync,
     build_items,
+    document_timestamp,
     render_line,
     split_batches,
 )
@@ -37,11 +38,19 @@ def make_raw(
     document_id: str = "2026-11-10:aiocqhttp:FriendMessage:10001",
     sent_time: str = T1,
     flushed: int = 0,
+    record_date: str | None = None,
 ) -> RawMessage:
-    """造一条记录，只覆盖测试关心的字段。"""
+    """造一条记录，只覆盖测试关心的字段。
+
+    ``record_date`` 默认从 ``document_id`` 前缀取（真实数据就是这样拼的），
+    简写的 ``document_id``（如 ``"d1"``）取不到日期时退回 T1 那天。
+    """
+    date_prefix = document_id.split(":")[0]
+    if record_date is None:
+        record_date = date_prefix if ":" in document_id else "2026-11-10"
     return RawMessage(
         id=id,
-        record_date=document_id.split(":")[0],
+        record_date=record_date,
         document_id=document_id,
         sender_id=sender_id,
         persona_id="",
@@ -149,17 +158,54 @@ class TestBuildItems:
         items = build_items([make_raw()])
         assert items[0]["update_mode"] == "append"
 
-    def test_timestamp_is_first_record_of_document(self) -> None:
-        """timestamp 取文档内最早那条，避免被摄取时刻顶替。"""
+    def test_timestamp_is_midnight_of_record_date(self) -> None:
+        """timestamp 取当天零点，不是该批首条记录的时刻。
+
+        文档级时间每 append 一次就被覆盖一次，所以它必须与「第几批」无关。
+        取首条记录的时间的话，同一天追加几次就把文档时间往后推几次。
+        """
         batch = [
             make_raw(id=1, sent_time=T1, document_id="d1"),
             make_raw(id=2, sent_time=T2, document_id="d1"),
         ]
         items = build_items(batch)
-        assert items[0]["timestamp"] == T1
+        assert items[0]["timestamp"] == "2026-11-10T00:00:00+08:00"
+
+    def test_timestamp_identical_across_batches_of_same_day(self) -> None:
+        """同一天的两批必须算出同一个 timestamp，覆盖才无害。"""
+        early = build_items([make_raw(id=1, sent_time="2026-11-10T00:00:03+08:00")])
+        late = build_items([make_raw(id=2, sent_time="2026-11-10T23:59:59+08:00")])
+        assert early[0]["timestamp"] == late[0]["timestamp"]
 
     def test_empty_batch(self) -> None:
         assert build_items([]) == []
+
+
+class TestDocumentTimestamp:
+    """文档级时间戳的推导。"""
+
+    def test_uses_record_date_not_sent_time_date(self) -> None:
+        """日期取 record_date，不取 message_sent_time 的前 10 位。
+
+        两者在负时区下可能差一天；record_date 在写入时已按本机时区算好，
+        与 document_id 里那个日期同源。
+        """
+        raw = make_raw(sent_time="2026-11-10T22:30:00-05:00")
+        raw.record_date = "2026-11-11"  # 本机已是次日
+        assert document_timestamp(raw) == "2026-11-11T00:00:00-05:00"
+
+    def test_keeps_offset(self) -> None:
+        raw = make_raw(sent_time="2026-11-10T10:30:00+08:00")
+        assert document_timestamp(raw).endswith("+08:00")
+
+    def test_drops_time_part(self) -> None:
+        raw = make_raw(sent_time="2026-11-10T23:59:59+08:00")
+        assert document_timestamp(raw) == "2026-11-10T00:00:00+08:00"
+
+    def test_missing_offset_is_tolerated(self) -> None:
+        """没有时区的老数据不硬凑，交给服务端按默认时区解释。"""
+        raw = make_raw(sent_time="2026-11-10T10:30:00")
+        assert document_timestamp(raw) == "2026-11-10T00:00:00"
 
 
 @dataclass
@@ -286,15 +332,43 @@ class TestHindsightSyncRun:
 
     async def test_success_enqueues_with_operation_id(self, log) -> None:
         store = FakeStore([make_raw(id=1), make_raw(id=2, text="第二条")])
-        client = FakeClient(operation_id="op-abc")
+        client = FakeClient()
         outcome = await HindsightSync(
             store, client, bank_id="dev", max_chars=10_000, log=log
         ).run()
         assert outcome.ok is True
         assert outcome.flushed == 2
-        assert store.enqueued == [([1, 2], "op-abc")]
+        assert len(store.enqueued) == 1
+        ids, enqueued_id = store.enqueued[0]
+        assert ids == [1, 2]
+        # 关键：本地记下的就是这个 id，发出去的也是这个 id。两者必须相等，
+        # 否则崩溃后对账会查一个服务端从没见过的 id。
+        assert enqueued_id == client.operation_ids[0]
         assert len(client.calls) == 1
         assert client.calls[0][0] == "dev"
+
+    async def test_enqueues_before_sending(self, log) -> None:
+        """凭据必须在请求之前落库：这是崩在中间的整条防线。"""
+        order: list[str] = []
+
+        class OrderedStore(FakeStore):
+            def mark_enqueued(self, ids, *, operation_id, items_count=0):
+                order.append("enqueue")
+                return super().mark_enqueued(
+                    ids, operation_id=operation_id, items_count=items_count
+                )
+
+        class OrderedClient(FakeClient):
+            async def retain(self, *args, **kwargs):
+                order.append("retain")
+                return await super().retain(*args, **kwargs)
+
+        store = OrderedStore([make_raw(id=1)])
+        await HindsightSync(
+            store, OrderedClient(), bank_id="dev", max_chars=10_000, log=log
+        ).run()
+
+        assert order == ["enqueue", "retain"]
 
     async def test_submits_asynchronously(self, log) -> None:
         """异步提交是这一层的核心：同步一次要 80 秒以上。"""
@@ -316,8 +390,11 @@ class TestHindsightSyncRun:
         assert sent is not None
         assert len(sent) == 36  # uuid4 的字符串形式
 
-    async def test_error_does_not_enqueue(self, log) -> None:
-        """提交失败不能标记，否则这批内容就永远丢了。"""
+    async def test_error_keeps_rows_enqueued_for_reconcile(self, log) -> None:
+        """提交失败不能退回待投递：服务端可能其实收到了。
+
+        留在「已入队」，下一轮对账查同一个 id：404 说明确实没到，才退回重投。
+        """
         store = FakeStore([make_raw(id=1)])
         client = FakeClient(error=HindsightConnectionError("连不上"))
         outcome = await HindsightSync(
@@ -325,18 +402,22 @@ class TestHindsightSyncRun:
         ).run()
         assert outcome.ok is False
         assert outcome.flushed == 0
-        assert store.enqueued == []
+        # 凭据已经落库（请求发出之前就写好了）
+        assert len(store.enqueued) == 1
+        # 但没有被退回待投递
+        assert store.released == []
         assert log.text_of("error")
 
-    async def test_success_false_is_treated_as_failure(self, log) -> None:
-        """服务端回 200 但 success=false，同样不能标记。"""
+    async def test_success_false_keeps_rows_enqueued(self, log) -> None:
+        """服务端回 200 但 success=false：同样留给对账判断。"""
         store = FakeStore([make_raw(id=1)])
         client = FakeClient(success=False)
         outcome = await HindsightSync(
             store, client, bank_id="dev", max_chars=10_000, log=log
         ).run()
         assert outcome.ok is False
-        assert store.enqueued == []
+        assert len(store.enqueued) == 1
+        assert store.released == []
 
     async def test_stops_at_first_failing_batch(self, log) -> None:
         """首批失败后不再尝试后续批次，避免把错误日志刷满。"""
@@ -348,7 +429,8 @@ class TestHindsightSyncRun:
         ).run()
         assert outcome.ok is False
         assert len(client.calls) == 1
-        assert store.enqueued == []
+        # 只有首批拿到了凭据，后面的批次连 mark_enqueued 都不会走到
+        assert len(store.enqueued) == 1
 
     async def test_multiple_batches_all_enqueued(self, log) -> None:
         """多批全部成功时，每批各自入队。"""
@@ -363,19 +445,24 @@ class TestHindsightSyncRun:
         assert len(store.enqueued) == len(client.calls)
         assert outcome.flushed == 5
 
-    async def test_missing_operation_id_falls_back_to_done(self, log) -> None:
-        """服务端没回 operation_id 时无从对账，只能按已提交处理。
+    async def test_missing_operation_id_in_response_keeps_local_id(self, log) -> None:
+        """服务端没回 operation_id 时继续用本地那个。
 
-        留在待投递会被重复追加，比误判完成更糟。
+        本地这个 id 是我们发请求时给出的，对账查它就知道到底收没收到；
+        丢它换成「按已提交处理」反而断了对账线索。
         """
         store = FakeStore([make_raw(id=1)])
         client = FakeClient(operation_id="")
         outcome = await HindsightSync(
             store, client, bank_id="dev", max_chars=10_000, log=log
         ).run()
-        assert store.enqueued == []
-        assert store.marked == [1]
         assert outcome.flushed == 1
+        ids, enqueued_id = store.enqueued[0]
+        assert ids == [1]
+        assert enqueued_id == client.operation_ids[0]
+        # 没有走「按已提交处理」那条老路
+        assert store.marked == []
+        assert any("继续使用本地 id" in msg for msg in log.text_of("warning"))
 
 
 class TestReconcile:

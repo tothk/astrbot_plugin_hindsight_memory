@@ -220,7 +220,7 @@ class TestFormatMemories:
 
         text = format_memories(results, 5)
 
-        assert text.splitlines()[0].startswith("以下是你对该用户既往对话的记忆片段")
+        assert text.splitlines()[0].startswith("【相关记忆】")
 
 
 class TestParseDailyTime:
