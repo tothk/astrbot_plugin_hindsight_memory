@@ -29,6 +29,49 @@ _DEFAULT_TIMEOUT = 3.0
 _HEADER = "【相关记忆】以下是你们过往对话中与当前话题相关的片段，仅供参考，不要逐条复述："
 
 
+def _is_memory_part(part: object) -> bool:
+    """判断一个 content part 是不是本模块注入的记忆片段。
+
+    只认页眉前缀，不认 ``_no_save``：后者 AstrBot 自带的知识库注入也在用
+    （``astr_main_agent/knowledge_base.py``），按它过滤会连别人的内容一起删掉。
+
+    ``getattr`` 那层是防别的 part 类型：``image_url``/``audio_url``/``think``
+    没有 ``text`` 字段，直接取属性会 ``AttributeError``。
+
+    Args:
+        part: 待判定的 content part，鸭子类型即可。
+
+    Returns:
+        是记忆片段返回 True。
+    """
+    text = getattr(part, "text", None)
+    return isinstance(text, str) and text.startswith(_HEADER)
+
+
+def prune_previous_memories(parts: list) -> int:
+    """就地移除上一次注入的记忆片段，为本次注入腾位置。
+
+    同一个请求被处理两遍时（热重载导致 handler 重复注册、或将来某个 runner
+    重复触发钩子），裸 ``append`` 会让用户消息里叠出两段「【相关记忆】」，
+    同一份背景被模型读两遍、白烧 token。
+
+    **必须就地改**（``parts[:] = ...``）而不是重新绑定：tool 循环的重查询
+    直接持有 ``req.extra_user_content_parts`` 这个列表对象
+    （``tool_loop_agent_runner`` 里 ``extra_user_content_parts=self.req....``），
+    重新绑定会让它继续用那份带旧片段的列表。
+
+    Args:
+        parts: ``ProviderRequest.extra_user_content_parts``。
+
+    Returns:
+        移除的片段条数。
+    """
+    kept = [part for part in parts if not _is_memory_part(part)]
+    removed = len(parts) - len(kept)
+    parts[:] = kept
+    return removed
+
+
 def format_memories(results: list[dict], limit: int) -> str:
     """把召回结果整理成注入文本。
 

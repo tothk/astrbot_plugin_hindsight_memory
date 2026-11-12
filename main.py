@@ -12,6 +12,7 @@ from .config.plugin_paths import PluginPaths
 from .db.models.sql_model_manager import SqlModelManager
 from .core.capture import MessageCapture
 from .core.memory_service import MemoryService, format_sync_result
+from .core.recall import prune_previous_memories
 from .core.recorder import Recorder
 from .hindsight.plugin_config import HindsightConfig
 
@@ -133,6 +134,10 @@ class HindsightMemory(Star):
         #    挂在最后一条用户消息上，历史部分仍能命中缓存。
         # 2. 语义。记忆是「这次对话需要的背景」，不是「你是谁」的设定，
         #    放用户消息里更贴合它在上下文中的角色。
+        # 先摘掉自己上一轮留下的：同一个请求被处理两遍时（热重载导致 handler
+        # 重复注册等），裸 append 会让用户消息里叠出两段记忆。只认自己的页眉，
+        # 不动知识库等插件写的片段。
+        prune_previous_memories(req.extra_user_content_parts)
         # mark_as_temp()：只在本次请求里带给模型，不写进会话历史。不加它，
         # 每轮召回的片段会被 _save_to_history 累积进 history，越滚越大。
         req.extra_user_content_parts.append(TextPart(text=memory).mark_as_temp())
