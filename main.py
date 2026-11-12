@@ -18,7 +18,7 @@ from .hindsight.plugin_config import HindsightConfig
 
 # 插件元数据由 metadata.yaml 提供。AstrBot 3.5.19+ 会自动识别继承 Star 的插件类，
 # 已废弃的 @register 装饰器不再使用，避免宿主未来移除它时插件无法加载。
-class MyPlugin(Star):
+class HindsightMemory(Star):
     def __init__(self, context: Context, config: dict | None = None):
         """初始化插件。
 
