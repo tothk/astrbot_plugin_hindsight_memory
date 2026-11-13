@@ -161,34 +161,23 @@ class TestFormatMemories:
 
         assert format_memories(results, 0) == ""
 
-    def test_observation_is_placed_first(self):
+    def test_results_keep_server_order(self):
+        # 服务端已按相关性排好序（且只给 observation），这里不能再重排。
         results = [
-            {"text": "world fact", "type": "world"},
-            {"text": "她最近工作压力大", "type": "observation"},
-        ]
-
-        text = format_memories(results, 5)
-        lines = text.splitlines()
-
-        assert "她最近工作压力大" in lines[1]
-        assert "world fact" in lines[2]
-
-    def test_type_order_is_stable_within_group(self):
-        results = [
-            {"text": "第一个 world", "type": "world"},
-            {"text": "第二个 world", "type": "world"},
+            {"text": "第一条", "type": "observation"},
+            {"text": "第二条", "type": "observation"},
         ]
 
         lines = format_memories(results, 5).splitlines()
 
-        assert "第一个 world" in lines[1]
-        assert "第二个 world" in lines[2]
+        assert "第一条" in lines[1]
+        assert "第二条" in lines[2]
 
-    def test_limit_truncates_after_observation_first(self):
+    def test_limit_truncates_in_server_order(self):
         results = [
-            {"text": "world 1", "type": "world"},
             {"text": "obs 1", "type": "observation"},
             {"text": "obs 2", "type": "observation"},
+            {"text": "obs 3", "type": "observation"},
         ]
 
         lines = format_memories(results, 2).splitlines()
@@ -202,7 +191,7 @@ class TestFormatMemories:
         results = [
             {"text": "", "type": "observation"},
             {"type": "observation"},
-            {"text": "有效事实", "type": "world"},
+            {"text": "有效事实", "type": "observation"},
         ]
 
         lines = format_memories(results, 5).splitlines()
@@ -211,12 +200,12 @@ class TestFormatMemories:
         assert "有效事实" in lines[1]
 
     def test_text_is_stripped(self):
-        results = [{"text": "  她喜欢猫  ", "type": "world"}]
+        results = [{"text": "  她喜欢猫  ", "type": "observation"}]
 
         assert "- 她喜欢猫" in format_memories(results, 5)
 
     def test_header_is_present(self):
-        results = [{"text": "她喜欢猫", "type": "world"}]
+        results = [{"text": "她喜欢猫", "type": "observation"}]
 
         text = format_memories(results, 5)
 

@@ -127,6 +127,27 @@ class TestRecallOrCreateBank:
 
         assert [kw["budget"] for kw in client.keywords] == ["low", "low"]
 
+    async def test_filters_to_observation_at_server(self):
+        # 类型过滤必须交给服务端：它参与检索与重排，客户端筛的话
+        # 重排仍要处理全部类型的候选，正是召回超时的根因。
+        client = FakeClient()
+
+        await _recall_or_create_bank(client, "b1", "q", Log())
+
+        assert client.keywords[0]["types"] == ["observation"]
+
+    async def test_retry_after_create_also_filters_types(self):
+        client = FakeClient(
+            responses=[HindsightBankNotFoundError("not found"), {"results": []}]
+        )
+
+        await _recall_or_create_bank(client, "b1", "q", Log())
+
+        assert [kw["types"] for kw in client.keywords] == [
+            ["observation"],
+            ["observation"],
+        ]
+
     async def test_create_failure_propagates(self):
         client = FakeClient(
             responses=[HindsightBankNotFoundError("not found")], create_ok=False
