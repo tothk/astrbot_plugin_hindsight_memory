@@ -14,9 +14,21 @@ import asyncio
 
 from ..hindsight.client import HindsightBankNotFoundError, HindsightClient, HindsightError
 
+# 只召回 observation。
+#
 # observation 是 Hindsight 从多条事实归纳出的稳定结论（例如「她最近工作压力大」），
-# 比零散的一句 world 事实更适合放进对话上下文，所以优先。
-_PREFERRED_TYPE = "observation"
+# 比零散的一句 world 事实更适合放进对话上下文。
+#
+# 关键点是这个过滤交给**服务端**做，而不是拿回来再挑：`types` 直接参与检索，
+# 四路（semantic/bm25/graph/temporal）只对指定 fact_type 跑，RRF 融合与
+# cross-encoder 重排的候选池从一开始就只剩 observation。改成客户端过滤的话，
+# 重排照样要处理全部类型的候选——生产库上实测单次召回的重排输入能到 160K token，
+# 这正是召回超时的直接原因。
+#
+# 代价：observation 由服务端后台的 consolidation 任务归纳产出，新库刚灌完数据
+# 时可能还没有，那几轮召回会是空的。这是有意的取舍——宁可这轮没有记忆，
+# 也不要把零散事实塞进上下文。
+_RECALL_TYPES = ["observation"]
 
 # 单次召回的硬超时。主回复的延迟不能被记忆检索拖住：宁可这轮没有记忆，
 # 也不能让用户等待。Hindsight 冷启动首次检索可能要几秒。
@@ -82,6 +94,9 @@ def prune_previous_memories(parts: list) -> int:
 def format_memories(results: list[dict], limit: int) -> str:
     """把召回结果整理成注入文本。
 
+    服务端已经按 ``types`` 只返回 observation，且结果按相关性排好序，
+    所以这里按原顺序取前 ``limit`` 条即可，不做重排。
+
     Args:
         results: ``recall`` 返回的 ``results`` 列表。
         limit: 最多保留几条，对应配置项 ``recall_memory_quantity``。
@@ -92,17 +107,11 @@ def format_memories(results: list[dict], limit: int) -> str:
     if limit <= 0:
         return ""
 
-    # 稳定排序：observation 排前面，同类型内保持服务端给出的相关性顺序。
-    ordered = sorted(
-        results,
-        key=lambda item: 0 if item.get("type") == _PREFERRED_TYPE else 1,
-    )
-
     lines: list[str] = []
-    for item in ordered:
+    for item in results:
         text = str(item.get("text") or "").strip()
         if not text:
-            # observation 之外的条目偶尔没有正文（只有结构化字段），跳过。
+            # 极少数记忆只有结构化字段、没有正文，跳过而不是留一个空项目符。
             continue
         lines.append(f"- {text}")
         if len(lines) >= limit:
@@ -139,15 +148,16 @@ async def _recall_or_create_bank(
     """
     try:
         return await client.recall(
-            bank_id, query, budget=_RECALL_BUDGET
+            bank_id, query, types=_RECALL_TYPES, budget=_RECALL_BUDGET
         )
     except HindsightBankNotFoundError:
         # 走到这里说明库确实不存在（404 是服务端明确告知的），
         # 建库后立刻重试，用户这一轮就能拿到记忆，不必等下一轮。
+        # 重试也要带全参数：首次安装必然走这条分支，漏了就等于那一轮没用新策略。
         await client.ensure_bank(bank_id)
         log.info(f"记忆库 {bank_id!r} 不存在，已按默认配置创建")
         return await client.recall(
-            bank_id, query, budget=_RECALL_BUDGET
+            bank_id, query, types=_RECALL_TYPES, budget=_RECALL_BUDGET
         )
 
 
