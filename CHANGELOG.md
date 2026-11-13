@@ -5,6 +5,20 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 并且遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 【0.0.3】 - 2026-11-13
+
+### 优化
+
+- perf(recall): 召回改用 low 预算，并把返回大小交还给服务端默认
+
+### 修复
+
+ - fix(recall): 注入记忆前先清掉自己上一轮的片段，避免重复叠加
+
+### 重构
+
+ - refactor：统一各处 bank_id 默认值；插件主类重命名（历史遗留问题）
+ - docs：添加 CHANGLOG.md 文件
 
 ## [0.0.2] - 2026-11-11
 
