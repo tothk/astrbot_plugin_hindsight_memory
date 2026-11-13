@@ -22,11 +22,61 @@ _PREFERRED_TYPE = "observation"
 # 也不能让用户等待。Hindsight 冷启动首次检索可能要几秒。
 _DEFAULT_TIMEOUT = 3.0
 
+# 召回深度。服务端默认是 mid（候选池 300 条、图遍历也更深），实测在
+# 一对一的陪伴场景里会稳定跑满 3 秒超时，这一轮的记忆就白丢了。
+# low 对应候选池 100 条——我们每轮最终只取 5 条（recall_memory_quantity），
+# 100 条候选足够排在前面的几条浮出来，而搜索耗时降一大截。
+# 参考 docs/hindsight-api.md 5.4 的推荐组合：聊天机器人回复用 low。
+_RECALL_BUDGET = "low"
+
 # 注入到用户消息里的标题。用纯文本而不是 JSON，是为了让模型读起来像背景信息
 # 而不是结构化数据——后者容易被它当成待处理的任务。
 # 这段文字最终出现在**用户消息**里（见 main.py 的 on_llm_request），所以用
 # 「【相关记忆】」这种块标记把边界标清楚，避免模型把记忆内容当成用户刚说的话。
 _HEADER = "【相关记忆】以下是你们过往对话中与当前话题相关的片段，仅供参考，不要逐条复述："
+
+
+def _is_memory_part(part: object) -> bool:
+    """判断一个 content part 是不是本模块注入的记忆片段。
+
+    只认页眉前缀，不认 ``_no_save``：后者 AstrBot 自带的知识库注入也在用
+    （``astr_main_agent/knowledge_base.py``），按它过滤会连别人的内容一起删掉。
+
+    ``getattr`` 那层是防别的 part 类型：``image_url``/``audio_url``/``think``
+    没有 ``text`` 字段，直接取属性会 ``AttributeError``。
+
+    Args:
+        part: 待判定的 content part，鸭子类型即可。
+
+    Returns:
+        是记忆片段返回 True。
+    """
+    text = getattr(part, "text", None)
+    return isinstance(text, str) and text.startswith(_HEADER)
+
+
+def prune_previous_memories(parts: list) -> int:
+    """就地移除上一次注入的记忆片段，为本次注入腾位置。
+
+    同一个请求被处理两遍时（热重载导致 handler 重复注册、或将来某个 runner
+    重复触发钩子），裸 ``append`` 会让用户消息里叠出两段「【相关记忆】」，
+    同一份背景被模型读两遍、白烧 token。
+
+    **必须就地改**（``parts[:] = ...``）而不是重新绑定：tool 循环的重查询
+    直接持有 ``req.extra_user_content_parts`` 这个列表对象
+    （``tool_loop_agent_runner`` 里 ``extra_user_content_parts=self.req....``），
+    重新绑定会让它继续用那份带旧片段的列表。
+
+    Args:
+        parts: ``ProviderRequest.extra_user_content_parts``。
+
+    Returns:
+        移除的片段条数。
+    """
+    kept = [part for part in parts if not _is_memory_part(part)]
+    removed = len(parts) - len(kept)
+    parts[:] = kept
+    return removed
 
 
 def format_memories(results: list[dict], limit: int) -> str:
@@ -64,7 +114,7 @@ def format_memories(results: list[dict], limit: int) -> str:
 
 
 async def _recall_or_create_bank(
-    client: HindsightClient, bank_id: str, query: str, log
+        client: HindsightClient, bank_id: str, query: str, log
 ) -> dict:
     """召回记忆；库不存在时先建库再重试一次。
 
@@ -88,23 +138,27 @@ async def _recall_or_create_bank(
         HindsightError: 其它请求失败。
     """
     try:
-        return await client.recall(bank_id, query, max_tokens=1024)
+        return await client.recall(
+            bank_id, query, budget=_RECALL_BUDGET
+        )
     except HindsightBankNotFoundError:
         # 走到这里说明库确实不存在（404 是服务端明确告知的），
         # 建库后立刻重试，用户这一轮就能拿到记忆，不必等下一轮。
         await client.ensure_bank(bank_id)
         log.info(f"记忆库 {bank_id!r} 不存在，已按默认配置创建")
-        return await client.recall(bank_id, query, max_tokens=1024)
+        return await client.recall(
+            bank_id, query, budget=_RECALL_BUDGET
+        )
 
 
 async def recall_memories(
-    client: HindsightClient,
-    bank_id: str,
-    query: str,
-    quantity: int,
-    log,
-    *,
-    timeout: float = _DEFAULT_TIMEOUT,
+        client: HindsightClient,
+        bank_id: str,
+        query: str,
+        quantity: int,
+        log,
+        *,
+        timeout: float = _DEFAULT_TIMEOUT,
 ) -> str:
     """召回与当前消息相关的记忆。
 

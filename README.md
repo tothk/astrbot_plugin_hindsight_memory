@@ -93,7 +93,7 @@ LLM 没有跨会话的记忆。你把历史全塞进上下文，也是几轮之�
 | `hindsight_host` | string | `localhost` | Hindsight 服务地址 |
 | `hindsight_port` | int | `8888` | Hindsight API 端口（不是控制台端口） |
 | `hindsight_token` | string | 空 | 可选。服务端未开鉴权就留空，插件不会发 `Authorization` 头 |
-| `hindsight_bank_id` | string | `default` | 写入与召回共用的记忆库。服务端已有数据时必须填一致，否则会对着空库召回 |
+| `hindsight_bank_id` | string | `01a1c652-f619-77c9-87ab-ad9d71a5c910` | 写入与召回共用的记忆库。服务端已有数据时必须填一致，否则会对着空库召回 |
 | `sync_batch_chars` | int | `5000` | 单批字符上限，同时也是「攒够多少字提前投递」的阈值 |
 | `sync_daily_time` | string | `00:05` | 每日补投时刻，`HH:MM`，按本机时区 |
 | `recall_memory_quantity` | int | `5` | 每轮注入的记忆条数 |

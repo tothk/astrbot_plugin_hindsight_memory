@@ -12,7 +12,7 @@ from typing import Mapping
 
 # 服务端必填的 bank 标识；插件目前只用这一个库。
 # 留空会拼出 ``/v1/default/banks//memories``，服务端一律 404，所以给个默认值。
-DEFAULT_BANK_ID = "default"
+DEFAULT_BANK_ID = "01a1c652-f619-77c9-87ab-ad9d71a5c910"
 
 # 与 _conf_schema.json 的 default 保持一致：配置项缺失时按这里的值兜底。
 _DEFAULT_HOST = "localhost"

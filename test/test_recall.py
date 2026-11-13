@@ -47,9 +47,12 @@ class FakeClient:
         self._responses = list(responses or [{"results": []}])
         self._create_ok = create_ok
         self.calls: list[tuple] = []
+        # 与 calls 分开记：calls 断言的是顺序与次数，keywords 断言的是参数。
+        self.keywords: list[dict] = []
 
     async def recall(self, bank_id, query, **kwargs):
         self.calls.append(("recall", bank_id, query))
+        self.keywords.append(dict(kwargs))
         item = self._responses.pop(0) if self._responses else {"results": []}
         if isinstance(item, Exception):
             raise item
@@ -104,6 +107,25 @@ class TestRecallOrCreateBank:
             await _recall_or_create_bank(client, "b1", "q", Log())
 
         assert sum(1 for c in client.calls if c[0] == "ensure_bank") == 1
+
+    async def test_uses_low_budget(self):
+        # 服务端默认 mid 会稳定跑满 3 秒超时，这里钉死成 low。
+        client = FakeClient()
+
+        await _recall_or_create_bank(client, "b1", "q", Log())
+
+        assert client.keywords[0]["budget"] == "low"
+
+    async def test_retry_after_create_also_uses_low_budget(self):
+        # 两次 recall 都要带 budget：只改第一次的话，首次安装（必然走建库
+        # 分支）的那一轮仍是 mid。
+        client = FakeClient(
+            responses=[HindsightBankNotFoundError("not found"), {"results": []}]
+        )
+
+        await _recall_or_create_bank(client, "b1", "q", Log())
+
+        assert [kw["budget"] for kw in client.keywords] == ["low", "low"]
 
     async def test_create_failure_propagates(self):
         client = FakeClient(
