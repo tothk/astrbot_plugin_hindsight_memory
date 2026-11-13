@@ -5,6 +5,16 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 并且遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## 【0.0.4】 - 2026-11-13
+
+### 优化
+
+ - perf(recall): 类型过滤下推到服务端检索阶段，只召回 observation
+
+### 说明
+
+ - 修复重要设置版本
+
 ## 【0.0.3】 - 2026-11-13
 
 ### 优化

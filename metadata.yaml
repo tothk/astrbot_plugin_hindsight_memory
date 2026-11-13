@@ -1,7 +1,7 @@
 name: astrbot_plugin_hindsight_memory # 插件唯一识别名，以 astrbot_plugin_ 前缀开头
 display_name: Hindsight 记忆储存 # 用于展示的名字，可以是方便人类阅读的名字（需要版本 >= v4.5.0，低版本不会报错，请放心填写）
 desc: ⚠️ 使用本插件的前提是 单人单机器人私聊（只养一条鱼）。记录 QQ 每一句私聊原始对话，存入自托管 Hindsight 服务器，并在会话中召回相关记忆。 # 插件简短描述
-version: v0.0.3 # 插件版本号。格式：v1.1.1 或者 v1.1
+version: v0.0.4 # 插件版本号。格式：v1.1.1 或者 v1.1
 author: tothk # 作者
 repo: https://github.com/tothk/astrbot_plugin_hindsight_memory # 插件的仓库地址
 support_platforms:
