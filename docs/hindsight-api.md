@@ -361,7 +361,7 @@ schema 规则：必须是对象且至少一个属性；属性类型限 `string`/
 
 ## 8. 本项目（AstrBot 插件）如何对接
 
-结合已定的写入策略（每 `sync_batch_chars` 字符一批、积压达阈值自动投、每日 00:05 补投、`/hindsight_sync` 手动投、同 `document_id` 追加），落地要点如下。
+结合已定的写入策略（每 `sync_batch_chars` 字符一批、积压达阈值自动投、启动时补一轮、每日 00:05 补投、`/hindsight_sync` 手动投、同 `document_id` 追加），落地要点如下。
 
 ### 8.1 关键结论：不要自己拼 JSON Lines
 
@@ -424,6 +424,12 @@ await client.retain(bank_id, items, is_async=True, operation_id=operation_id)
 
 反过来（先提交、拿到 id 再落库）会留下一个窗口：服务端已排队、本地没凭据，进程一崩这批就停在待投递，下一轮换个新 uuid 重投，文档里多一份。
 
+**归属要记在行上**（`rawmessage.operation_id`），不能只存批次首尾 id：
+
+> 一次认领拿到的 id 可能带洞——低 id 的行被上一个失败批次退回过，中间又插进了新行。此时 `min/max` 构成的闭区间会盖住**别的批次**仍处于 `已入队` 的行：那一批对账完成时，把这些行一并标成 `2`，等于绕过 retry，服务端若最终失败就永久丢记忆；撤回时同理会把别人的行退回重投，造成重复。
+>
+> 所以对账与撤回都用 `WHERE operation_id = ?`。`first_row_id/last_row_id` 保留下来只作遥测（日志里看得到这批大致覆盖哪个 id 范围），不参与任何状态回写。
+
 反过来的代价是「本地记了、服务端没收到」，这靠对账解决——提交时用的就是本地记下的那个 id，所以 404 只能意味着服务端从没收到过：
 
 - 查到 `completed` → 行记录标 `2`，删掉批次凭据；
@@ -431,7 +437,17 @@ await client.retain(bank_id, items, is_async=True, operation_id=operation_id)
 - 累计 3 次仍失败 → 退回 `flushed=0`（宁可文档末尾重复一遍，也不能让记录永远卡在中间态）；
 - 404 → 退回 `flushed=0`，下一轮用新 id 重投。
 
-对账不能只靠「下次投新内容时顺便查」：用户三天不说话就没有「下次」，失败批次会永远停在 `flushed=1`。所以每日 00:05 的定时任务要跑完整的 `reconcile() + submit()`。
+对账不能只靠「下次投新内容时顺便查」：用户三天不说话就没有「下次」，失败批次会永远停在 `flushed=1`。本项目的对账由三处驱动，缺一不可：
+
+| 触发点 | 频率 | 跑什么 | 为什么需要它 |
+|---|---|---|---|
+| 启动补投 | 插件加载时 1 次 | `reconcile() + submit()` | 停机期间服务端可能已跑完在途批次，不补要等到下个 00:05 |
+| 周期对账 | 每 5 分钟（`_RECONCILE_INTERVAL = 300.0`） | 只 `reconcile()` | 投递是异步的，确认延迟几十秒到几分钟；只靠每日一次，刚投出去的批次要挂一整天 |
+| 每日补投 | `sync_daily_time`（默认 00:05） | `reconcile() + submit()` | 兜底：把当天没攒够阈值的零散记录清掉 |
+
+对账与投递共用一把进程内的锁，且周期对账**不投递新内容**——两件事的正交性一旦被打破（比如对账顺手投一批），失败重试的语义就说不清了。
+
+> 实测教训：这一版之前对账只挂在每日 00:05。有一批记录在服务端早已 `completed`，本地却停在 `flushed=1` 挂了两天，日志上完全看不出来——因为积压触发按单条正文长度累加，短对话攒不满 `sync_batch_chars` 就永远不触发。加上启动补投与周期对账后，最长挂 5 分钟。
 
 ### 8.5 记忆库不存在时要主动创建
 
@@ -442,16 +458,16 @@ await client.retain(bank_id, items, is_async=True, operation_id=operation_id)
 | `POST .../memories`（retain） | **200**，并顺带把 bank 建出来 |
 | `POST .../memories/recall` | **404** `Bank 'xxx' not found` |
 
-后果：一个刚装好的插件，第一次对话必然走在 retain 之前，于是召回永远 404，表现为「有记录、但 AI 一直记不住你」。日志里只有一行 `记忆召回失败：请求被拒绝（HTTP 404）：Bank 'default' not found`。
+后果：一个刚装好的插件，第一次对话必然走在 retain 之前，于是召回永远 404，表现为「有记录、但 AI 一直记不住你」。日志里是一行 `记忆召回失败：记忆库不存在（HTTP 404）：…`——注意这条 warning 只在建库**也**失败时才出现（`_recall_or_create_bank` 捕获 404 后会先自动建库再重试），所以正常路径下你不会看到它。
 
 正确做法是在召回侧兜底：
 
 ```python
 try:
-    return await client.recall(bank_id, query, max_tokens=1024)
+    return await client.recall(bank_id, query)
 except HindsightBankNotFoundError:          # 404 单独成一个异常类型
     await client.ensure_bank(bank_id)        # PUT /v1/default/banks/{bank_id}，body 传 {}
-    return await client.recall(bank_id, query, max_tokens=1024)   # 只重试一次
+    return await client.recall(bank_id, query)   # 只重试一次
 ```
 
 三个容易写错的点：
@@ -470,6 +486,55 @@ except HindsightBankNotFoundError:          # 404 单独成一个异常类型
 | `message_sent_time` | 每行括号内的时间。**不是** item 的 `timestamp` |
 | `document_id` | 原样作为 `document_id`（本项目格式 `日期:umo`） |
 | `record_date` | 派生出 item 的 `timestamp`：`{record_date}T00:00:00{时区}`。用 `record_date` 而不是 `message_sent_time[:10]`，因为前者写入时已按本机时区算好、与 `document_id` 同源 |
+
+### 8.7 记忆事实为什么是英文的，怎么改成中文
+
+现象：明明是中文对话，召回出来的却是 `Alice felt tired on November 10, 2026 | When: Tuesday, November 10, 2026 | Involving: Alice (user)` 这种英文事实。
+
+这不是插件写错了，而是**服务端抽取阶段的倾向问题**。原因有两层：
+
+1. retain 的 system prompt 主体、few-shot 示例、字段名（`what` / `when` / `where` / `who` / `why`）、`fact_type` 枚举全是英文；
+2. 虽然 prompt 里确实有一条语言规则——`LANGUAGE: Write every fact in the same language and script as the input text. Never translate.`，来源字段 `llm_output_language`、`active: True`——但它的值默认是 `None`。规则只说「跟着输入走」，压不住英文样例的惯性。
+
+**这条路走不通**：`llm_output_language` 是**服务端级静态字段**，不能按 bank 覆盖：
+
+```bash
+PATCH /v1/default/banks/{bank}/config
+{"updates": {"llm_output_language": "Chinese"}}
+# → 400 Cannot override static (server-level) fields: ['llm_output_language']
+```
+
+**可行做法**：给这个 bank 设 `retain_mission`（可 per-bank 覆盖）。它会以 `FOCUS — What to retain for this bank (takes priority over the general guidelines)` 的形式插进 prompt，优先级高于通用指南：
+
+```bash
+PATCH /v1/default/banks/{bank}/config
+{"updates": {"retain_mission": "所有提取出的事实必须使用简体中文书写，包括 what/when/where/who/why 字段；不要翻译成英文。"}}
+# → 200
+```
+
+想连 `observation`（由 consolidation 阶段归纳）一起改，同时设 `observations_mission`，写法同上。
+
+**验证要看对字段**（这里踩过坑）：`GET /v1/default/banks/{bank}/config` 返回的是**三层结构**：
+
+```
+{ "bank_id": ..., "config": {...}, "overrides": {...} }
+```
+
+真正生效的值在 `config.retain_mission` 与 `overrides.retain_mission` 里，两处都有。**顶层直接取 `retain_mission` 永远是 `None`**——拿它判断「PATCH 没生效」会得出完全错误的结论。
+
+想知道 mission 到底有没有进 prompt，用预览接口，不必真跑一次抽取：
+
+```bash
+POST /v1/default/banks/{bank}/prompts/preview
+{"operation": "retain"}
+```
+
+返回的 `messages[].blocks[]` 里找到 `field: "retain_mission"`、`active: true`、`source: "config"` 的那一块，`text` 里应当能看到你写的那句话。
+
+两个补充：
+
+- `HINDSIGHT_API_TEXT_SEARCH_EXTENSION_NATIVE_LANGUAGE=english` 只影响 BM25 分词用的词典，**不影响事实本身的书写语言**，改它没有用。
+- 这是服务端配置，不是插件配置。已经写进库里的英文事实不会因为改了 mission 就变中文，只对之后新提交的内容生效。要清掉旧事实，得删文档或重建 bank。
 
 ---
 

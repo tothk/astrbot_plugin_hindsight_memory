@@ -65,15 +65,24 @@ LLM 没有跨会话的记忆。你把历史全塞进上下文，也是几轮之�
 - **三态追踪**：`待投递 → 已入队 → 已确认`。投出去不等于记住了，得等服务端回话。
 - **自动对账**：每轮同步先查上批的状态。成功则落终态，失败先让服务端 retry（`append` 语义下重投会重复追加），屡败才退回重投。
 - **幂等提交**：`operation_id` 由本地生成、**提交前先落库**，它就是服务端的幂等键。所以无论是请求超时、进程被卸载、还是凭据写库失败，下一轮都能拿同一个 id 去问服务端要说法：查得到就等它跑完，查不到（404）就说明这批压根没送到，退回重投也不会多出一份内容。
-- **三路触发**：攒够 `sync_batch_chars` 字后台自动投、每天 `sync_daily_time` 补投一次、`/hindsight_sync` 随时手动投。
+- **五路触发**：启动时补投一轮、攒够 `sync_batch_chars` 字后台自动投、每 5 分钟对账一次、每天 `sync_daily_time` 补投一次、`/hindsight_sync` 随时手动投。
 - **只召回观察**：只向服务端要 `observation` 类型的记忆——它是对多次对话归纳出的结论，比单条事实更接近「这个人是什么样」。类型过滤在**检索阶段**生效（`types` 参数），不进入重排的候选池，所以重排开销只有全类型的一小部分。代价是刚灌完数据的库里可能还没有 observation，那几轮召回是空的。
 - **说话人消毒**：昵称里的换行和冒号会被清洗。否则一条发言能被劈成两行，甚至伪造出别人的发言人身份。
+
+**主动记忆（LLM 工具）**
+
+除了自动记录与自动召回，插件还向模型开放两个工具，由它自行判断何时调用：
+
+- **`proactive_recall`**：补充检索。每轮对话前都会自动召回一次；只有用户提到更久远、更具体的事（「我们之前说的那件事」），而当前上下文里没有相关记忆时，模型才会主动查一次。
+- **`proactive_retain`**：补充写入。模型判断某段内容值得立刻记住时，把内容整理成若干行交给它，插件整批落库后**只投递刚写进的这几行**，不惊动库里其他积压。
+
+两个工具都**只在一对一私聊中可用**。AstrBot 的工具是全局挂载的（不按会话过滤，注册时也带不上 `event_filter`），所以闸门建在工具函数内部：群聊里调用会直接返回「本插件只在一对一私聊中提供记忆能力」，既不读记忆也不写记忆。这条和上面的记录/召回限制是同一条边界，只是工具绕过了钩子那道判断，得单独堵。
 
 ## 安装
 
 **前置**
 
-- AstrBot v4.x（插件依赖其 `on_llm_request` / `on_llm_response` 钩子）
+- AstrBot 4.29.3 及以上（插件依赖其 `on_llm_request` / `on_llm_response` 钩子）
 - 一个可访问的 Hindsight 服务（[部署文档](https://hindsight.vectorize.io)）
 - Python 3.10+（由 AstrBot 提供，插件无需额外依赖）
 
@@ -124,6 +133,9 @@ LLM 没有跨会话的记忆。你把历史全塞进上下文，也是几轮之�
 | `message_sent_time` | 消息发生时刻，ISO 8601 带时区 |
 | `content_hash` | 去重指纹：`document_id + role + 正文` 的 SHA-256，唯一索引。不含时间与人格，也不含消息 ID |
 | `flushed` | `0` 待投递 / `1` 已入队 / `2` 已确认 |
+| `operation_id` | 这一行归属哪个提交批次。空串表示还没提交过。对账与撤回都按它定位，不按 id 区间 |
+
+> 带批次归属的这一版会在启动时自动做一次表结构迁移（`PRAGMA user_version` 从 1 到 2）：加 `operation_id` 列，并把升级瞬间还在途的批次**整体退回待投递**。它们会随下一轮同步重投一遍，代价是文档末尾可能多一段重复内容——重复可以接受，卡在「已入队」等不到结论才是真丢。
 
 `db/sqlite/` 下还有 `raw_message.db-wal` 和 `-shm`。SQLite 开了 WAL 模式，**备份时三个文件要一起拷**，或者先执行 `PRAGMA wal_checkpoint(TRUNCATE)`。
 
@@ -135,20 +147,28 @@ LLM 没有跨会话的记忆。你把历史全塞进上下文，也是几轮之�
 | --- | --- |
 | 日志完全没有「已记录」 | 是不是群聊？插件只记私聊 |
 | 「⚠️ 本条对话记录保存失败」 | `raw_message.db` 被占用或磁盘满；看日志里的具体异常 |
-| `/hindsight_sync` 报「请求超时」 | 服务端在处理，但耗时超过 `RETAIN_TIMEOUT`；异步提交正常不会卡这么久，检查网络 |
+| `/hindsight_sync` 报「请求超时」 | 服务端没能在 30 秒内接下这批（`DEFAULT_TIMEOUT`）。提交是异步的，正常只花几百毫秒；一直超时说明服务过载或网络不通，先 `curl <host>:<port>/health` |
 | `/hindsight_sync` 报「HTTP 404」 | `hindsight_bank_id` 填错，或服务端从没建过这个库（插件会自动建） |
 | 「本轮没有命中记忆」一直出现 | 记录还没投递成功，或 bank 是空的；先跑一次 `/hindsight_sync` |
-| 召回到的记忆是英文的 | 服务端抽取模型的倾向问题，与插件无关，详见 [docs/hindsight-api.md](docs/hindsight-api.md) |
+| 召回到的记忆是英文的 | 服务端抽取模型的倾向问题，与插件无关。给 bank 设 `retain_mission` 可改成中文，见 [docs/hindsight-api.md 8.7 节](docs/hindsight-api.md#87-记忆事实为什么是英文的怎么改成中文) |
 | 记忆里的名字是 `user` | 配置 `user_nickname`，或确认平台能提供真实昵称 |
 
 ## 开发与测试
 
+测试**必须在 AstrBot 的源码环境里跑**，不能拿一个干净虚拟环境从零开始：
+
+- 插件要放在 `<AstrBot 源码根>/data/plugins/` 下——`test/conftest.py` 按 `PLUGIN_DIR.parents[2]` 反推宿主源码根，靠它把 `astrbot` 加进 `sys.path`；放别处会直接 `ModuleNotFoundError: No module named 'astrbot'`。
+- 解释器要用激活了宿主依赖的那个 venv（`sqlalchemy`、`sqlmodel`、`httpx` 都随 AstrBot 安装，项目自己的 `requirements.txt` 是空的）。`pytest` 与 `pytest-asyncio` 才是额外依赖，见 `requirements-dev.txt`。
+
 ```bash
-pip install -r requirements-dev.txt
-pytest
+# 在 <AstrBot 源码根> 下，先激活宿主 venv
+pip install -r data/plugins/astrbot_plugin_hindsight_memory/requirements-dev.txt
+python -m pytest data/plugins/astrbot_plugin_hindsight_memory -q
 ```
 
-测试不连接真实服务：`httpx.MockTransport` 拦截所有 HTTP，SQLite 用临时目录。跑通约需 7 秒。
+单靠 `pip install -r requirements-dev.txt && pytest` 在干净环境里跑不起来：缺 `astrbot` 本身，也缺 `sqlmodel`／`sqlalchemy`。
+
+测试不连接真实服务：`httpx.MockTransport` 拦截所有 HTTP，SQLite 用临时目录。跑通约需 10 秒。
 
 ```
 core/       记录与召回的编排（纯逻辑，不依赖 AstrBot 的运行时）
@@ -157,6 +177,12 @@ hindsight/  Hindsight HTTP 客户端与同步层
 config/     路径与配置（当前配置走 _conf_schema.json）
 docs/       Hindsight API 中文文档
 ```
+
+## 相关文档
+
+- [docs/hindsight-api.md](docs/hindsight-api.md)：Hindsight HTTP API 1.2.0 中文文档，含本项目对接方式（投递状态机、对账、记忆库创建、字段映射、事实语言的修改办法）
+- [CHANGELOG.md](CHANGELOG.md)：版本变更记录
+- [CONTRIBUTING.md](CONTRIBUTING.md)：提交信息规范与开发约定
 
 ## 隐私与数据安全
 

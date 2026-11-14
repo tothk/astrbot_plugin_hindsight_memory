@@ -138,7 +138,7 @@ class TestHindsightConfigFromMapping:
 
     @pytest.mark.parametrize(
         ("raw", "expected"),
-        [(0, 1), (-3, 1), (999, 50)],
+        [(0, 1), (-3, 1), (999, 30)],
     )
     def test_recall_quantity_is_clamped(self, raw, expected):
         config = HindsightConfig.from_mapping({"recall_memory_quantity": raw})

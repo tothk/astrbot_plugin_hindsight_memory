@@ -32,8 +32,9 @@ class BaseStore:
     def mark_flushed(self, ids, value: int = 2) -> int:
         return len(list(ids))
 
-    def mark_enqueued(self, ids, *, operation_id: str, items_count: int = 0) -> int:
-        return len(list(ids))
+    def mark_enqueued(self, ids, *, operation_id: str) -> list:
+        # 认领语义：返回真正拿到的行，调用方据此过滤原批次。
+        return list(ids)
 
     def pending_operations(self, limit: int = 100):
         return []
@@ -48,7 +49,7 @@ class BaseStore:
 
 
 class OkClient:
-    async def get_operation(self, bank_id: str, operation_id: str):
+    async def get_operation(self, bank_id: str, operation_id: str, *, timeout=None):
         return {"status": "completed"}
 
 
@@ -98,7 +99,7 @@ class TestStoreFailuresBecomeOutcome:
             def list_unflushed(self, limit: int = 1000):
                 return [make_raw(1)]
 
-            def mark_enqueued(self, ids, *, operation_id, items_count=0):
+            def mark_enqueued(self, ids, *, operation_id):
                 raise RuntimeError("disk full")
 
         calls = []
@@ -127,9 +128,10 @@ class TestStoreFailuresBecomeOutcome:
             def list_unflushed(self, limit: int = 1000):
                 return [make_raw(1)]
 
-            def mark_enqueued(self, ids, *, operation_id, items_count=0):
+            def mark_enqueued(self, ids, *, operation_id):
                 self.enqueued.append((list(ids), operation_id))
-                return 1
+                # 认领语义：返回真正拿到的主键列表，不是行数。
+                return list(ids)
 
             def release_operation(self, operation_id):
                 self.released.append(operation_id)
@@ -164,9 +166,9 @@ class TestStoreFailuresBecomeOutcome:
             def list_unflushed(self, limit: int = 1000):
                 return [make_raw(1)]
 
-            def mark_enqueued(self, ids, *, operation_id, items_count=0):
+            def mark_enqueued(self, ids, *, operation_id):
                 self.enqueued.append(operation_id)
-                return 1
+                return list(ids)
 
             def mark_flushed(self, ids, value: int = 2):
                 self.flushed_marks.append((list(ids), value))
@@ -221,7 +223,7 @@ class TestStoreFailuresBecomeOutcome:
                 raise RuntimeError("database is locked")
 
         class MissingClient:
-            async def get_operation(self, bank_id, operation_id):
+            async def get_operation(self, bank_id, operation_id, *, timeout=None):
                 from astrbot_plugin_hindsight_memory.hindsight.client import (
                     HindsightOperationNotFoundError,
                 )

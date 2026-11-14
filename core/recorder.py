@@ -6,6 +6,7 @@
 
 import asyncio
 import hashlib
+from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, Awaitable, Callable, Protocol, Sequence
 
@@ -257,6 +258,25 @@ def build_raw_message(
     )
 
 
+@dataclass(frozen=True)
+class SaveResult:
+    """一次（批量）写入的结果。
+
+    Attributes:
+        rows: 真正新增的记录，已带主键，顺序与传入顺序一致。
+        duplicates: 判定为内容重复、被跳过的条数。
+        ok: 数据库写入是否成功。为 False 时 ``rows`` 必定为空。
+
+    Note:
+        ``ok`` 与 ``rows`` 是两个独立维度：判重跳过是「成功但没新增」，
+        不是失败——重复不是故障，不该让调用方以为出了错。
+    """
+
+    rows: tuple[RawMessage, ...] = ()
+    duplicates: int = 0
+    ok: bool = True
+
+
 class Recorder:
     """把记录写入数据库；失败时仅在首次失败通知一次。
 
@@ -302,45 +322,83 @@ class Recorder:
         except Exception as e:
             self._log.error(f"记录成功后的回调失败: {e}")
 
+    async def save_many(
+        self,
+        rows: Sequence[RawMessage],
+        notify: Callable[[], Awaitable[None]],
+        *,
+        trigger_backlog: bool = True,
+    ) -> SaveResult:
+        """在一个事务里写入多条记录。
+
+        与 ``save()`` 的区别不只是省几次线程跳转：批量写入要么整批进库、
+        要么整批失败，不会出现「前两行写进去了、后三行没有」的半批状态，
+        调用方才能给出准确的结果文案。
+
+        Args:
+            rows: 待落库的记录列表。
+            notify: 失败时调用的异步通知回调，只在首次失败时触发。
+            trigger_backlog: 是否把新增正文的长度报给 ``on_saved``。那是个
+                「攒够字数就投一轮全库积压」的触发器。调用方**紧接着要亲自
+                投递这几行**时必须传 False（见 ``proactive_retain``）：否则
+                累加器一旦被顶过阈值，后台那轮会先把手头这几行扫走并投一次，
+                紧接着调用方又投一次，同一段内容在文档里追加两遍。
+
+        Returns:
+            写入结果：新增的行、被判重的条数、以及写库是否成功。
+        """
+        if not rows:
+            return SaveResult(rows=(), duplicates=0, ok=True)
+
+        try:
+            # 同步的 Session + commit 不能直接放在事件循环里：
+            # 抢不到 sqlite 写锁时会阻塞整个线程（最长 connect_args timeout 秒），
+            # 连心跳与其它会话一起停摆，所以移到工作线程执行。
+            inserted = await asyncio.to_thread(self._sql.insert_many, list(rows))
+        except Exception as e:
+            self._log.error(f"批量写入原始记录失败（{len(rows)} 条）: {e}")
+            if not self._warned:
+                self._warned = True
+                # 记录失败对陪伴场景不可接受，必须让用户看见；但只提示第一次。
+                await notify()
+            return SaveResult(rows=(), duplicates=0, ok=False)
+
+        duplicates = len(rows) - len(inserted)
+        self._warned = False
+
+        if not inserted:
+            # 同一天同一会话里内容完全相同的消息会被判重丢弃，这是设计行为。
+            # 打到 info 是为了实测时能对上"少了几行"，不必怀疑是漏记。
+            self._log.info(f"内容重复，跳过写入 {duplicates} 条")
+            return SaveResult(rows=(), duplicates=duplicates, ok=True)
+
+        for raw in inserted:
+            self._log.info(
+                f"已记录 [{raw.role}] {raw.document_id} "
+                f"id={raw.id} persona={raw.persona_id or '(空)'} "
+                f"len={len(raw.raw_message)}"
+            )
+        if duplicates:
+            self._log.info(f"另有 {duplicates} 条内容重复，跳过写入")
+
+        # 攒字数触发只报一次，报新增正文的总长度而不是逐条报：
+        # 下游 note_saved() 本来就是累加器，一次加总与多次累加等价，
+        # 但少了几次调用，也不会因为中途异常而只加了一半。
+        if trigger_backlog:
+            self._notify_saved(sum(len(raw.raw_message) for raw in inserted))
+        return SaveResult(rows=tuple(inserted), duplicates=duplicates, ok=True)
+
     async def save(self, raw: RawMessage, notify: Callable[[], Awaitable[None]]) -> bool:
         """写入一条记录。
-
-        写入放到工作线程执行，避免抢 sqlite 写锁时阻塞事件循环。
 
         Args:
             raw: 待落库的记录。
             notify: 失败时调用的异步通知回调，只在首次失败时触发。
 
         Returns:
-            True 表示写入成功，False 表示失败。
+            True 表示写入成功（内容重复也算成功），False 表示失败。
         """
-        try:
-            # 同步的 Session + commit 不能直接放在事件循环里：
-            # 抢不到 sqlite 写锁时会阻塞整个线程（最长 connect_args timeout 秒），
-            # 连心跳与其它会话一起停摆，所以移到工作线程执行。
-            # 内容重复时 insert_raw 返回 None（唯一索引挡下），不是故障。
-            saved = await asyncio.to_thread(self._sql.insert_raw, raw)
-        except Exception as e:
-            self._log.error(f"写入原始记录失败: {e}")
-            if not self._warned:
-                self._warned = True
-                # 记录失败对陪伴场景不可接受，必须让用户看见；但只提示第一次。
-                await notify()
-            return False
-        if saved is None:
-            # 同一天同一会话里内容完全相同的消息会被判重丢弃，这是设计行为。
-            # 打到 info 是为了实测时能对上"少了几行"，不必怀疑是漏记。
-            self._log.info(
-                f"内容重复，跳过写入 [{raw.role}] {raw.document_id} "
-                f"{raw.raw_message[:20]!r}"
-            )
-            self._warned = False
-            return True
-        self._log.info(
-            f"已记录 [{raw.role}] {raw.document_id} "
-            f"id={saved.id} persona={raw.persona_id or '(空)'} "
-            f"len={len(raw.raw_message)}"
-        )
-        self._warned = False
-        self._notify_saved(len(raw.raw_message))
-        return True
+        # 单条也只是长度为 1 的批量，两条路径共用同一套判重与通知逻辑，
+        # 免得「单条能判重、批量不能」这类不一致。
+        result = await self.save_many([raw], notify)
+        return result.ok

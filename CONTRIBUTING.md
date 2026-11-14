@@ -127,16 +127,35 @@ docs: update README installation steps
 
 ## 工具链
 
-### 1. 安装依赖
+这是一个纯 Python 仓库，**没有 npm、没有 Node 依赖**。下面的配置都是可选的，仓库里也刻意没有提交 `.husky/` 或 `commitlint.config.js`——本地钩子属于个人环境，不该进版本库。
+
+### 1. 代码检查
+
+```bash
+ruff check .
+ruff format .
+```
+
+### 2. 跑测试
+
+测试要在 AstrBot 的源码环境里跑（原因见 README「开发与测试」）：
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest . -q
+```
+
+### 3. 可选：本地提交信息校验
+
+想在自己机器上强制 Conventional Commits，可以装 `commitlint`（需要 Node）。装完**不要把生成的钩子提交上去**：
 
 ```bash
 npm i -D @commitlint/cli @commitlint/config-conventional husky
 npx husky init
+echo 'npx --no -- commitlint --edit "$1"' > .husky/commit-msg
 ```
 
-### 2. 配置 commitlint
-
-`commitlint.config.js`：
+`commitlint.config.js` 内容：
 
 ```js
 module.exports = {
@@ -144,19 +163,14 @@ module.exports = {
 };
 ```
 
-### 3. 配置 husky 钩子
-
-`.husky/commit-msg`：
-
-```bash
-npx --no -- commitlint --edit "$1"
-```
+装好后把 `node_modules/`、`.husky/`、`commitlint.config.js`、`package.json` 都加进 `.gitignore`（如果你确实不想让它们共享）。
 
 ### 4. 可选工具
 
-- [commitizen](https://github.com/commitizen/cz-cli)：交互式生成提交信息
-- [standard-version](https://github.com/conventional-changelog/standard-version)：根据提交自动生成 CHANGELOG 与版本号
+- [commitizen](https://github.com/commitizen/cz-cli)：交互式生成提交信息（同样需要 Node）
 - [semantic-release](https://github.com/semantic-release/semantic-release)：全自动发布流水线
+
+> 注意：上面的类型前缀（`feat`/`fix`/`docs`…）是规范，**冒号后的标题写中文就好**。本仓库的历史提交都是中文标题，这不违反约定；一致性比语言重要。
 
 ## 其他约定
 

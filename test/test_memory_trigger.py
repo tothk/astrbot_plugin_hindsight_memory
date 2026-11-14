@@ -7,7 +7,9 @@ test_hindsight_sync.py 覆盖。因此把 ``service._sync`` 换成假对象，
 
 import asyncio
 
+from astrbot_plugin_hindsight_memory.core import memory_service
 from astrbot_plugin_hindsight_memory.core.memory_service import MemoryService
+from astrbot_plugin_hindsight_memory.hindsight.client import HindsightConnectionError
 from astrbot_plugin_hindsight_memory.hindsight.plugin_config import HindsightConfig
 from astrbot_plugin_hindsight_memory.hindsight.sync import SyncOutcome
 
@@ -30,9 +32,20 @@ class FakeSync:
             messages=2, batches=1, documents=1, flushed=2
         )
         self.calls = 0
+        self.records_calls: list[list] = []
+        self.reconcile_calls = 0
+        self.reconcile_outcome = SyncOutcome()
 
     async def run(self) -> SyncOutcome:
         self.calls += 1
+        return self.outcome
+
+    async def reconcile(self) -> SyncOutcome:
+        self.reconcile_calls += 1
+        return self.reconcile_outcome
+
+    async def submit_records(self, records) -> SyncOutcome:
+        self.records_calls.append(list(records))
         return self.outcome
 
 
@@ -238,3 +251,332 @@ class TestSyncMutualExclusion:
         retry = await service.sync_once(trigger="手动指令")
         assert retry.ok is True
         assert retry.flushed == 2
+
+
+class TestSyncRecords:
+    """按指定记录投递：与 sync_once 共用同一把锁，但不跑对账、不扫全库。"""
+
+    async def test_submits_the_given_records(self, log):
+        service, sync = make_service(log)
+        rows = [object(), object()]
+
+        outcome = await service.sync_records(rows, trigger="主动写入")
+
+        assert outcome.ok is True
+        assert sync.records_calls == [rows]
+        # 关键：没有走 sync_once 那条「扫全库 + 对账」的路。
+        assert sync.calls == 0
+
+    async def test_empty_records_skip_the_lock_and_the_client(self, log):
+        service, sync = make_service(log)
+
+        outcome = await service.sync_records([])
+
+        assert outcome.ok is True
+        assert outcome.flushed == 0
+        assert sync.records_calls == []
+
+    async def test_exception_becomes_an_error_outcome(self, log):
+        # 投递异常不能冒到工具函数里——那会让模型看到堆栈，
+        # 而我们真正想说的是「已记到本地，稍后重试」。
+        service, _sync = make_service(log)
+
+        class BoomSync:
+            async def submit_records(self, records):
+                raise RuntimeError("boom")
+
+        service._sync = BoomSync()
+        outcome = await service.sync_records([object()])
+
+        assert outcome.ok is False
+        assert "boom" in (outcome.error or "")
+        assert any("boom" in msg for msg in log.text_of("error"))
+
+    async def test_waits_for_a_running_sync_once(self, log):
+        # 主动写入与后台投递／手动指令共用同一把锁：
+        # 两边同时读到同一批待投递记录会导致重复追加。
+        service, sync = make_service(log)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockingSync:
+            async def run(self):
+                entered.set()
+                await release.wait()
+                return SyncOutcome(messages=1, batches=1, documents=1, flushed=1)
+
+            async def submit_records(self, records):
+                return SyncOutcome(messages=1, batches=1, documents=1, flushed=1)
+
+        service._sync = BlockingSync()
+        background = asyncio.create_task(service.sync_once(trigger="每日补投"))
+        await entered.wait()
+
+        active = asyncio.create_task(service.sync_records([object()]))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not active.done(), "上一轮还在跑，这一轮必须等锁"
+
+        release.set()
+        await background
+        await active
+
+
+class FakeBankClient:
+    """只响应 ensure_bank 的假客户端，用来测启动时建库。"""
+
+    base_url = "http://fake-hindsight"
+    token_present = False
+
+    def __init__(self, *, created: bool = True, error: Exception | None = None):
+        self.created = created
+        self.error = error
+        self.ensure_calls: list[str] = []
+
+    async def ensure_bank(self, bank_id: str) -> bool:
+        self.ensure_calls.append(bank_id)
+        if self.error is not None:
+            raise self.error
+        return self.created
+
+    async def aclose(self) -> None:
+        return None
+
+
+class TestEnsureBankOnStart:
+    """启动时确认记忆库存在。
+
+    写入与召回共用同一个库：召回有兜底建库，但那条路要走「每轮对话前先召回」，
+    召回超时或服务不可达时这一轮不会建库，紧接着的首次投递就会撞上库缺失。
+    """
+
+    async def test_start_ensures_bank_once(self, log):
+        service, _sync = make_service(log)
+        client = FakeBankClient(created=False)
+        service._client = client
+
+        await service.start()
+        try:
+            assert client.ensure_calls == [service._config.bank_id]
+        finally:
+            await service.stop()
+
+    async def test_created_bank_is_logged(self, log):
+        service, _sync = make_service(log)
+        service._client = FakeBankClient(created=True)
+
+        await service.start()
+        try:
+            assert any("不存在，已按默认配置创建" in msg for msg in log.text_of("info"))
+        finally:
+            await service.stop()
+
+    async def test_connection_failure_does_not_block_startup(self, log):
+        # 远端此刻不可达不该阻止插件启动：记录会留在本地，恢复后补投。
+        service, _sync = make_service(log)
+        service._client = FakeBankClient(
+            error=HindsightConnectionError("连接超时")
+        )
+
+        await service.start()  # 不应抛异常
+        try:
+            assert service._task is not None, "每日补投任务仍应启动"
+            assert any("无法确认记忆库" in msg for msg in log.text_of("warning"))
+        finally:
+            await service.stop()
+
+    async def test_timeout_is_reported_and_survivable(self, log):
+        service, _sync = make_service(log)
+        release = asyncio.Event()
+
+        class SlowClient:
+            base_url = "http://fake-hindsight"
+            token_present = False
+
+            async def ensure_bank(self, bank_id: str) -> bool:
+                await release.wait()
+                return False
+
+            async def aclose(self) -> None:
+                return None
+
+        service._client = SlowClient()
+        # 把超时压到极短，避免测试真的等 5 秒。
+        original = memory_service._ENSURE_BANK_TIMEOUT
+        memory_service._ENSURE_BANK_TIMEOUT = 0.01
+        try:
+            await service.start()
+            assert service._task is not None
+            assert any("确认记忆库超时" in msg for msg in log.text_of("warning"))
+        finally:
+            release.set()
+            memory_service._ENSURE_BANK_TIMEOUT = original
+            await service.stop()
+
+
+class TestStartupCatchUp:
+    """启动时立刻补一轮同步，消除停机期间的状态漂移。"""
+
+    async def test_start_runs_one_sync_after_ensuring_bank(self, log):
+        # 顺序也要对：库还没确认存在就去投递，首批会白撞一轮。
+        order: list[str] = []
+        service, sync = make_service(log)
+        original_run = sync.run
+
+        async def tracked_run():
+            order.append("run")
+            return await original_run()
+
+        sync.run = tracked_run  # type: ignore[method-assign]
+
+        class Client(FakeBankClient):
+            async def ensure_bank(self, bank_id: str) -> bool:
+                order.append("ensure")
+                return await super().ensure_bank(bank_id)
+
+        service._client = Client(created=False)
+        await service.start()
+        try:
+            assert order == ["ensure", "run"]
+            assert sync.calls == 1
+            assert any("启动补投" in msg for msg in log.text_of("info"))
+        finally:
+            await service.stop()
+
+    async def test_reconcile_task_starts_with_the_service(self, log):
+        service, _sync = make_service(log)
+        service._client = FakeBankClient(created=False)
+
+        await service.start()
+        try:
+            assert service._reconcile_task is not None
+        finally:
+            await service.stop()
+        assert service._reconcile_task is None
+
+
+class TestReconcileOnce:
+    """只对账、不投递。"""
+
+    async def test_only_calls_reconcile(self, log):
+        service, sync = make_service(log)
+        sync.reconcile_outcome = SyncOutcome(completed=2)
+
+        outcome = await service.reconcile_once(trigger="测试")
+
+        assert sync.reconcile_calls == 1
+        assert sync.calls == 0, "对账不该顺手投递新内容"
+        assert outcome.completed == 2
+
+    async def test_nothing_to_check_stays_at_debug(self, log):
+        # 每 5 分钟跑一次，没在途批次时不能刷 info。
+        service, _sync = make_service(log)
+
+        await service.reconcile_once(trigger="周期对账")
+
+        assert any("没有需要确认的批次" in msg for msg in log.text_of("debug"))
+        assert not any("周期对账完成" in msg for msg in log.text_of("info"))
+
+    async def test_touched_batches_are_reported(self, log):
+        service, sync = make_service(log)
+        sync.reconcile_outcome = SyncOutcome(completed=1, retried=1, released=1)
+
+        await service.reconcile_once(trigger="周期对账")
+
+        assert any("确认落地 1 批" in msg for msg in log.text_of("info"))
+
+    async def test_exception_becomes_an_error_outcome(self, log):
+        service, sync = make_service(log)
+
+        class BoomSync:
+            async def reconcile(self):
+                raise RuntimeError("库锁住了")
+
+        service._sync = BoomSync()
+        outcome = await service.reconcile_once(trigger="测试")
+
+        assert outcome.ok is False
+        assert "库锁住了" in outcome.error
+
+    async def test_waits_for_a_running_sync_once(self, log):
+        """对账与投递必须串行：撤回会把行写回待投递，正在读快照的那轮会读到一半。"""
+        service, _sync = make_service(log)
+        snapshot_taken = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockingSync:
+            async def run(self):
+                snapshot_taken.set()
+                await release.wait()
+                return SyncOutcome()
+
+            async def reconcile(self):
+                return SyncOutcome(completed=1)
+
+        service._sync = BlockingSync()
+        background = asyncio.create_task(service.sync_once(trigger="积压触发"))
+        await snapshot_taken.wait()
+
+        active = asyncio.create_task(service.reconcile_once(trigger="周期对账"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not active.done(), "上一轮投递还没结束，对账必须等锁"
+
+        release.set()
+        await background
+        await active
+
+
+class TestReconcileLoop:
+    """周期对账任务本身。"""
+
+    async def test_loop_reconciles_repeatedly(self, log):
+        service, sync = make_service(log)
+        # 把间隔压到极短，避免测试真的等 5 分钟。
+        original = memory_service._RECONCILE_INTERVAL
+        memory_service._RECONCILE_INTERVAL = 0.01
+        try:
+            task = asyncio.create_task(service._reconcile_loop())
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if sync.reconcile_calls >= 2:
+                    break
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            assert sync.reconcile_calls >= 2
+        finally:
+            memory_service._RECONCILE_INTERVAL = original
+
+    async def test_loop_survives_a_failing_round(self, log):
+        # 这个任务没有人会重启，穿透一次就永久停摆。
+        service, _sync = make_service(log)
+        attempts = {"n": 0}
+
+        class FlakySync:
+            async def reconcile(self):
+                attempts["n"] += 1
+                if attempts["n"] == 1:
+                    raise RuntimeError("第一轮炸了")
+                return SyncOutcome(completed=1)
+
+        service._sync = FlakySync()
+        original = memory_service._RECONCILE_INTERVAL
+        memory_service._RECONCILE_INTERVAL = 0.01
+        try:
+            task = asyncio.create_task(service._reconcile_loop())
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if attempts["n"] >= 2:
+                    break
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            assert attempts["n"] >= 2, "第一轮异常后循环必须继续"
+            assert any("周期对账异常" in msg for msg in log.text_of("error"))
+        finally:
+            memory_service._RECONCILE_INTERVAL = original

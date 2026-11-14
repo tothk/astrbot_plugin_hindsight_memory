@@ -21,7 +21,12 @@ from dataclasses import dataclass
 from typing import Protocol, Sequence
 
 from ..db.models.models import RawMessage, SyncOperation
-from .client import HindsightClient, HindsightError, HindsightOperationNotFoundError
+from .client import (
+    HindsightClient,
+    HindsightConnectionError,
+    HindsightError,
+    HindsightOperationNotFoundError,
+)
 from .plugin_config import clean_nickname
 
 # 一条记录渲染成对话文本里的一行，行与行之间用换行拼接。
@@ -38,6 +43,25 @@ _LINE_SEPARATOR = "\n"
 # 服务端的 LLM 额度。放弃时把记录退回待投递：宁可文档末尾重复一遍，也不能让
 # 用户的记录永远卡在「已入队」这个中间态里。
 MAX_ATTEMPTS = 3
+
+# 一轮投递最多从库里扫多少行。
+#
+# 它限制的不是「一次请求发多大」（那是 max_chars 的事），而是「一次持锁扫
+# 多少行」：``sync_once()`` 的锁会包住整个 run()，行数越多，锁被占用的时间
+# 越长；这段时间里手动 /hindsight_sync 会一直等着。
+#
+# 1000 行按每行 200 字估算约 200KB，按默认 5000 字一批切出来 40 批。异步提交
+# 下每批只打个招呼就返回，所以真出现积压也扛得住；只有在手动指令明显变迟钝时
+# 才需要调小它。
+_DEFAULT_PENDING_LIMIT = 1000
+
+# 对账时单次状态查询的超时秒数。
+#
+# 对账是一串短请求，不是一次长抽取：查状态只该花几百毫秒。但客户端的默认
+# 超时是 30 秒（那是留给 retain 的），恢复期服务不可达时，N 条凭据 × 30 秒
+# 会把一轮对账拖成几十分钟——期间 ``_sync_lock`` 一直被占着，手动
+# /hindsight_sync 会一直等下去。
+_RECONCILE_TIMEOUT = 10.0
 
 
 def _sanitize_speaker(name: str) -> str:
@@ -285,9 +309,12 @@ class SyncStore(Protocol):
         ids: Sequence[int],
         *,
         operation_id: str,
-        items_count: int = 0,
-    ) -> int:
-        """把一批记录标为「已入队」并写下操作凭据。"""
+    ) -> list[int]:
+        """认领一批仍处于待投递状态的记录，并写下操作凭据。
+
+        Returns:
+            实际认领到的主键列表；已被其它同步轮次取走的行不在其中。
+        """
         ...
 
     def pending_operations(self, limit: int = 100) -> list[SyncOperation]:
@@ -388,7 +415,7 @@ class HindsightSync:
         self._user_name = user_name
         self._bot_name = bot_name
 
-    async def run(self, *, limit: int = 1000) -> SyncOutcome:
+    async def run(self, *, limit: int = _DEFAULT_PENDING_LIMIT) -> SyncOutcome:
         """执行一轮同步：先对账，再投递。
 
         Args:
@@ -454,6 +481,14 @@ class HindsightSync:
         Note:
             单个批次查不到就跳过，不影响别的批次：服务端可能临时抽风，下一轮
             再查就是了。
+
+            但**连不上服务端时直接结束本轮**，不再逐条重试：网络不通、服务没
+            起这类原因对后面每一条同样成立，继续查只是把「超时秒数 × 待查条数」
+            叠起来。这一点和 ``submit()`` 里「一批失败就不再尝试后续批次」是
+            同一个判断，两处保持一致。
+
+            状态查询用短超时（``_RECONCILE_TIMEOUT``）而不是客户端默认的 30 秒：
+            对账会被周期任务频繁调用，一条卡住不该拖住整轮。
         """
         completed = retried = released = 0
 
@@ -467,7 +502,9 @@ class HindsightSync:
         for record in pending:
             operation_id = record.operation_id
             try:
-                data = await self._client.get_operation(self._bank_id, operation_id)
+                data = await self._client.get_operation(
+                    self._bank_id, operation_id, timeout=_RECONCILE_TIMEOUT
+                )
             except HindsightOperationNotFoundError:
                 # 查询用的 id 就是提交时用的那个，所以 404 只有两种可能：
                 #   1. 提交根本没到达服务端（发出前崩溃、网络断了）；
@@ -476,6 +513,13 @@ class HindsightSync:
                 # 批次每轮同步都会被查到，活不到被清理，所以概率极低。
                 released += self._release(operation_id, "服务端查无此操作")
                 continue
+            except HindsightConnectionError as exc:
+                # 连不上就别再查了：后面每一条都会以同样的方式超时。
+                # 已经处理完的批次保留成果，剩下的下一轮再来。
+                self._log.warning(
+                    f"对账中断，服务端不可达（{len(pending)} 条待查）：{exc}"
+                )
+                break
             except HindsightError as exc:
                 self._log.warning(f"查询操作状态失败（{operation_id}）：{exc}")
                 continue
@@ -492,8 +536,16 @@ class HindsightSync:
                     self._log.error(f"标记批次完成失败（{operation_id}）：{exc}")
                     continue
                 completed += 1
+                # 报「实际落地几行 / 认领时几行」两个数：只报一个总数时，
+                # 回写少了也看不出来，正是区间串批次那个 bug 长期隐身的原因。
+                expected = getattr(record, "items_count", 0)
+                landed = (
+                    f"{resolved}/{expected} 条"
+                    if expected
+                    else f"{resolved} 条"
+                )
                 self._log.info(
-                    f"对账完成：operation={operation_id} {resolved} 条记录已确认落地"
+                    f"对账完成：operation={operation_id} {landed}记录已确认落地"
                 )
                 continue
 
@@ -599,25 +651,15 @@ class HindsightSync:
         )
         return 1
 
-    async def submit(self, *, limit: int = 1000) -> SyncOutcome:
-        """把还没入队的记录装配成批次，先在本地记下操作凭据，再提交。
+    async def submit(self, *, limit: int = _DEFAULT_PENDING_LIMIT) -> SyncOutcome:
+        """扫库取出待投递记录，逐批入队提交。
 
         Args:
-            limit: 本轮最多取多少条。
+            limit: 本轮最多从库里取多少条。注意它限制的是「一次持锁扫多少行」，
+                不是「一次请求发多大」——后者由 ``max_chars`` 决定。
 
         Returns:
-            投递阶段的摘要：``messages`` / ``batches`` / ``documents`` /
-            ``flushed``（成功入队的条数），失败时 ``error`` 非空。
-
-        Note:
-            顺序是「先落库、后提交」，不能反过来。以前是先提交、拿到
-            ``operation_id`` 才写进本地，于是「服务端已排队、凭据没落库」这个
-            窗口里的崩溃会让这一批停在待投递，下一轮换个新 uuid 重投，文档里
-            就多了一份。
-
-            反过来的代价是「本地记了、服务端没收到」，但那种情况在下一轮对账时
-            会稳定地拿到 404——既然提交时用的就是本地记下的那个 id，404 就只能
-            意味着服务端从没收到过，退回重投是安全的。
+            投递阶段的摘要，失败时 ``error`` 非空。
         """
         try:
             pending = await asyncio.to_thread(self._store.list_unflushed, limit)
@@ -629,14 +671,68 @@ class HindsightSync:
             self._log.debug("没有待提交的对话记录")
             return SyncOutcome()
 
+        return await self._submit_records(pending)
+
+    async def submit_records(self, records: Sequence[RawMessage]) -> SyncOutcome:
+        """只投递指定的这些记录，不查库。
+
+        给主动写入这类「我刚写了这几行，现在就把它送出去」的场景用：它不该
+        顺手把库里所有积压一起投，也不该触发对账。
+
+        Args:
+            records: 待投递的记录；空列表直接返回空摘要。
+
+        Returns:
+            投递阶段的摘要，字段含义与 ``submit()`` 相同。
+
+        Note:
+            这里只投递**仍处于待投递状态**的记录。从调用方写库到本方法执行
+            之间有一段窗口，每日补投、手动指令或别的会话的积压触发都可能先
+            把那批行取走并投出去；认领是条件更新（只承认 ``flushed`` 仍为
+            待投递的行），因此已被取走的部分会被静默跳过，不会重复追加。
+
+            这个保证来自数据库语句本身，不依赖调用方持锁。层内的
+            ``_sync_lock`` 只负责让同一个进程里的几路触发不并行，对别的
+            AstrBot 实例或手工打开的 sqlite 客户端无效。
+        """
+        if not records:
+            return SyncOutcome()
+        return await self._submit_records(list(records))
+
+    async def _submit_records(self, pending: Sequence[RawMessage]) -> SyncOutcome:
+        """把给定记录装配成批次，先在本地记下操作凭据，再提交。
+
+        这是 ``submit()`` 与 ``submit_records()`` 的共同实体，只负责「给定一批
+        记录之后」的部分，不关心它们是怎么来的。
+
+        Args:
+            pending: 待投递的记录，非空；顺序即提交顺序。
+
+        Returns:
+            投递阶段的摘要：``messages`` / ``batches`` / ``documents`` /
+            ``flushed``（成功入队的条数），失败时 ``error`` 非空。
+
+        Note:
+            顺序是「先认领、再装配、后提交」，三步都不能换位：
+
+            1. **先认领**。``mark_enqueued`` 只把仍处于待投递的行改成已入队，
+               并返回真正认领到的主键。这个条件更新是原子的，所以「写库 →
+               本方法执行」那段窗口里被别的同步轮次取走的行不会被投第二次。
+            2. **再装配**。只把认领到的行交给 ``build_items``，否则会把别人的
+               行也拼进这次的文档。
+            3. **后提交**。凭据必须在请求之前落库：以前是先提交、拿到
+               ``operation_id`` 才写进本地，于是「服务端已排队、凭据没落库」
+               这个窗口里的崩溃会让这一批停在待投递，下一轮换个新 uuid 重投，
+               文档里就多了一份。反过来的代价是「本地记了、服务端没收到」，
+               但那种情况在下一轮对账时会稳定地拿到 404——既然提交时用的就是
+               本地记下的那个 id，404 就只能意味着服务端从没收到过，退回重投
+               是安全的。
+        """
         batches = split_batches(pending, self._max_chars)
         documents = 0
         flushed = 0
 
         for index, batch in enumerate(batches, start=1):
-            items = build_items(
-                batch, user_name=self._user_name, bot_name=self._bot_name
-            )
             ids = [raw.id for raw in batch if raw.id is not None]
             awaited = f"第 {index}/{len(batches)} 批"
 
@@ -646,11 +742,14 @@ class HindsightSync:
             operation_id = str(uuid.uuid4())
 
             try:
-                await asyncio.to_thread(
+                # 先认领、再装配。认领是条件更新（只承认仍处于待投递的行），
+                # 所以「写入 → 获锁」这段窗口里被别的同步轮次取走的行不会被
+                # 重复投第二次。必须在 build_items 之前执行：只该把真正认领
+                # 到的行交给服务端。
+                claimed = await asyncio.to_thread(
                     self._store.mark_enqueued,
                     ids,
                     operation_id=operation_id,
-                    items_count=len(items),
                 )
             except Exception as exc:
                 # 凭据都没落库，请求也就不用发了：记录还是待投递，什么都没发生。
@@ -662,6 +761,27 @@ class HindsightSync:
                     flushed=flushed,
                     error=f"本地数据库异常：{exc}",
                 )
+
+            if not claimed:
+                # 一条都没认领到：这批已被别的同步轮次取走并提交过。
+                # 不是错误，跳过即可——别的批次可能还有机会，不能 return。
+                self._log.debug(
+                    f"{awaited} 没有可认领的记录（已被其它同步轮次处理），跳过"
+                )
+                continue
+
+            if len(claimed) < len(ids):
+                self._log.info(
+                    f"{awaited} 部分记录已被其它同步轮次认领，"
+                    f"本次只提交 {len(claimed)}/{len(ids)} 条"
+                )
+
+            claimed_set = set(claimed)
+            batch = [raw for raw in batch if raw.id in claimed_set]
+            ids = claimed
+            items = build_items(
+                batch, user_name=self._user_name, bot_name=self._bot_name
+            )
 
             try:
                 result = await self._client.retain(

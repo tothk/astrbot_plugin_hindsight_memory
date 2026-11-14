@@ -1,8 +1,10 @@
 """SqlModelManager 里投递相关的读写方法。
 
 用真实 sqlite（临时目录里的库），不 mock 数据库行为——这些方法的语义
-（按 id 升序、只取待投递、三态转换、批次区间回写）正是要靠真实 SQL 才能验证的。
+（按 id 升序、只取待投递、三态转换、按归属回写）正是要靠真实 SQL 才能验证的。
 """
+
+from sqlmodel import Session, select
 
 from astrbot_plugin_hindsight_memory.db.models.models import (
     FLUSHED_DONE,
@@ -113,10 +115,12 @@ class TestEnqueueAndResolve:
     def test_mark_enqueued_writes_batch_record(self, sql) -> None:
         first = sql.insert_raw(make_raw(text="一"))
         second = sql.insert_raw(make_raw(text="二"))
-        updated = sql.mark_enqueued(
-            [first.id, second.id], operation_id="op-1", items_count=1
+        claimed = sql.mark_enqueued(
+            [first.id, second.id], operation_id="op-1"
         )
-        assert updated == 2
+        # 返回值是「认领到的主键」而不是行数：调用方要据此过滤原批次，
+        # 只把真正属于这一次的行交给服务端。
+        assert claimed == [first.id, second.id]
         # 记录变成「已入队」，不再出现在待投递里
         assert sql.list_unflushed() == []
         # 批次凭据被写了下来，巡检才知道该问哪个 operation
@@ -127,8 +131,45 @@ class TestEnqueueAndResolve:
         assert pending[0].last_row_id == second.id
 
     def test_mark_enqueued_empty_ids_is_noop(self, sql) -> None:
-        assert sql.mark_enqueued([], operation_id="op-1") == 0
+        assert sql.mark_enqueued([], operation_id="op-1") == []
         assert sql.pending_operations() == []
+
+    def test_mark_enqueued_skips_rows_claimed_elsewhere(self, sql) -> None:
+        """已被别的同步轮次取走的行不再认领，否则会被投第二次。"""
+        first = sql.insert_raw(make_raw(text="一"))
+        second = sql.insert_raw(make_raw(text="二"))
+        # 模拟另一路已经把这批行标成「已入队」并提交
+        assert sql.mark_enqueued([first.id], operation_id="op-other") == [first.id]
+
+        # 后到的一路拿着同一批 id 来认领：第一行不该被它拿走
+        claimed = sql.mark_enqueued(
+            [first.id, second.id], operation_id="op-late"
+        )
+        assert claimed == [second.id]
+        # 凭据表的行号区间也只覆盖真正认领到的那一段
+        late = [op for op in sql.pending_operations() if op.operation_id == "op-late"]
+        assert len(late) == 1
+        assert late[0].first_row_id == second.id
+        assert late[0].last_row_id == second.id
+
+    def test_mark_enqueued_returns_empty_when_all_claimed(self, sql) -> None:
+        """一条都没认领到时不写凭据——没提交就不该留痕。"""
+        first = sql.insert_raw(make_raw(text="一"))
+        sql.mark_enqueued([first.id], operation_id="op-other")
+
+        assert sql.mark_enqueued([first.id], operation_id="op-late") == []
+        # 仍然只有先到那一路的凭据
+        assert [op.operation_id for op in sql.pending_operations()] == ["op-other"]
+
+    def test_mark_enqueued_never_revives_done_rows(self, sql) -> None:
+        """已完成的行不能被后到的认领改回「已入队」中间态。"""
+        first = sql.insert_raw(make_raw(text="一"))
+        sql.mark_enqueued([first.id], operation_id="op-1")
+        sql.resolve_operation("op-1", status="completed")
+        assert sql.count_by_flushed() == {FLUSHED_DONE: 1}
+
+        assert sql.mark_enqueued([first.id], operation_id="op-2") == []
+        assert sql.count_by_flushed() == {FLUSHED_DONE: 1}
 
     def test_resolve_completed_marks_rows_done(self, sql) -> None:
         first = sql.insert_raw(make_raw(text="一"))
@@ -149,6 +190,76 @@ class TestEnqueueAndResolve:
         assert gap.id is not None
         pending = sql.list_unflushed()
         assert [row.raw_message for row in pending] == ["夹在中间的新行"]
+
+    def test_resolve_completed_does_not_touch_other_ops_enqueued_rows(
+        self, sql
+    ) -> None:
+        """认领带洞时，闭区间会盖住别的批次仍在途的行。
+
+        这是「区间式回写」最致命的一种：op-y 的行被 op-z 的完成顺手标成
+        DONE，服务端若最终判定 op-y 失败，那几条记忆就永久丢了——绕过了
+        retry，也没人再会去重投。
+        """
+        # op-x 认领 [1,2,3] 后失败被退回，1,2,3 回到待投递
+        rows = [sql.insert_raw(make_raw(text=f"第{i}句")) for i in range(3)]
+        x_ids = [row.id for row in rows]
+        assert sql.mark_enqueued(x_ids, operation_id="op-x") == x_ids
+        sql.resolve_operation("op-x", status="failed", error="boom", attempts=3)
+        assert sql.release_operation("op-x") == 3
+
+        # op-y 认领 [4,5,6]，仍在服务端处理中
+        y_rows = [sql.insert_raw(make_raw(text=f"y{i}句")) for i in range(3)]
+        y_ids = [row.id for row in y_rows]
+        assert sql.mark_enqueued(y_ids, operation_id="op-y") == y_ids
+
+        # 新消息 7,8,9 到来，和重回待投递的 1,2,3 一起被 op-z 认领。
+        # 它的 id 集合是 {1,2,3,7,8,9}，min/max 区间恰好是 [1,9]，把 op-y 的
+        # 4,5,6 裹在中间。
+        z_rows = [sql.insert_raw(make_raw(text=f"z{i}句")) for i in range(3)]
+        z_ids = [row.id for row in z_rows]
+        claimed = sql.mark_enqueued(x_ids + z_ids, operation_id="op-z")
+        assert claimed == x_ids + z_ids
+        z_op = [op for op in sql.pending_operations() if op.operation_id == "op-z"][0]
+        assert z_op.first_row_id == x_ids[0]
+        assert z_op.last_row_id == z_ids[-1]
+
+        # op-z 完成：只能动它自己认领的 6 行
+        assert sql.resolve_operation("op-z", status="completed") == 6
+
+        # op-y 的三行必须仍是「已入队」，它的凭据也还在，等着下一轮对账
+        with Session(sql._engine) as session:
+            for row_id in y_ids:
+                row = session.get(RawMessage, row_id)
+                assert row is not None
+                assert row.flushed == FLUSHED_ENQUEUED, f"{row_id} 被别的批次改写了"
+                assert row.operation_id == "op-y", f"{row_id} 的归属被改写"
+        assert [op.operation_id for op in sql.pending_operations()] == ["op-y"]
+
+    def test_release_does_not_touch_other_ops_enqueued_rows(self, sql) -> None:
+        """撤回的对称面：区间同样会盖住别人的行，退回待投递就是重复投递。"""
+        rows = [sql.insert_raw(make_raw(text=f"第{i}句")) for i in range(3)]
+        x_ids = [row.id for row in rows]
+        sql.mark_enqueued(x_ids, operation_id="op-x")
+        sql.resolve_operation("op-x", status="failed", error="boom", attempts=3)
+        sql.release_operation("op-x")
+
+        y_rows = [sql.insert_raw(make_raw(text=f"y{i}句")) for i in range(3)]
+        y_ids = [row.id for row in y_rows]
+        sql.mark_enqueued(y_ids, operation_id="op-y")
+
+        z_rows = [sql.insert_raw(make_raw(text=f"z{i}句")) for i in range(3)]
+        z_ids = [row.id for row in z_rows]
+        sql.mark_enqueued(x_ids + z_ids, operation_id="op-z")
+
+        # 撤回 op-z：只能退回它自己的 6 行，op-y 的 3 行必须原样留在「已入队」
+        assert sql.release_operation("op-z") == 6
+        with Session(sql._engine) as session:
+            for row_id in y_ids:
+                row = session.get(RawMessage, row_id)
+                assert row is not None
+                assert row.flushed == FLUSHED_ENQUEUED, f"{row_id} 被误退回待投递"
+                assert row.operation_id == "op-y"
+        assert sql.count_by_flushed() == {FLUSHED_PENDING: 6, FLUSHED_ENQUEUED: 3}
 
     def test_resolve_failed_keeps_rows_enqueued(self, sql) -> None:
         row = sql.insert_raw(make_raw(text="一"))
@@ -187,6 +298,69 @@ class TestEnqueueAndResolve:
             "op-二",
             "op-三",
         ]
+
+
+class TestInsertMany:
+    """批量写入：一次事务写多行，并把判重结果如实报出来。"""
+
+    def test_writes_all_rows(self, sql) -> None:
+        rows = [make_raw(text="一"), make_raw(text="二"), make_raw(text="三")]
+
+        inserted = sql.insert_many(rows)
+
+        assert [row.raw_message for row in inserted] == ["一", "二", "三"]
+        assert all(row.id is not None for row in inserted)
+        assert len(sql.list_unflushed()) == 3
+
+    def test_empty_input_writes_nothing(self, sql) -> None:
+        assert sql.insert_many([]) == []
+        assert sql.list_unflushed() == []
+
+    def test_duplicate_in_database_is_filtered_out(self, sql) -> None:
+        # 库里已有的内容不该再写一遍，也不该算成失败。
+        sql.insert_raw(make_raw(text="已经记过"))
+
+        inserted = sql.insert_many([make_raw(text="已经记过"), make_raw(text="新的")])
+
+        assert [row.raw_message for row in inserted] == ["新的"]
+        with Session(sql._engine) as session:
+            assert len(session.exec(select(RawMessage)).all()) == 2
+
+    def test_duplicate_inside_the_batch_is_filtered_out(self, sql) -> None:
+        # 同一批里重复的内容也只能进一行：走的是同一条唯一索引。
+        inserted = sql.insert_many([make_raw(text="同一句"), make_raw(text="同一句")])
+
+        assert [row.raw_message for row in inserted] == ["同一句"]
+
+    def test_all_duplicates_returns_empty_list(self, sql) -> None:
+        sql.insert_raw(make_raw(text="旧的"))
+
+        inserted = sql.insert_many([make_raw(text="旧的"), make_raw(text="旧的")])
+
+        assert inserted == []
+
+    def test_committed_rows_keep_their_attributes(self, sql) -> None:
+        # expire_on_commit=False 的理由：commit 后对象还要被调用方拿去投递，
+        # 过期了就得为每个字段重新查库（而且是隐式 IO）。
+        inserted = sql.insert_many([make_raw(text="别过期")])
+
+        row = inserted[0]
+        assert row.raw_message == "别过期"
+        assert row.sender_id == "10001"
+        assert row.content_hash == "hash-别过期"
+
+    def test_integrity_error_falls_back_to_single_inserts(self, sql, monkeypatch) -> None:
+        # 竞态：筛选之后、commit 之前，别人抢先插入了同样的内容。
+        # 这里把「查重」屏蔽掉来复现那个窗口，再让真实唯一索引把 commit 打回来。
+        sql.insert_raw(make_raw(text="抢先一步"))
+        monkeypatch.setattr(sql, "_existing_hashes", lambda hashes: set())
+
+        inserted = sql.insert_many([make_raw(text="抢先一步"), make_raw(text="新的")])
+
+        # 整批没有丢：撞上的当作重复丢弃，其余照常写入。
+        assert [row.raw_message for row in inserted] == ["新的"]
+        with Session(sql._engine) as session:
+            assert len(session.exec(select(RawMessage)).all()) == 2
 
 
 class TestRoundTripWithSync:
@@ -231,7 +405,7 @@ class TestCrashRecovery:
                     is_async=is_async, usage={}, operation_id=operation_id,
                 )
 
-            async def get_operation(self, bank_id, operation_id):
+            async def get_operation(self, bank_id, operation_id, *, timeout=None):
                 if operation_id in self.submitted:
                     return {"status": "completed"}
                 raise HindsightOperationNotFoundError("查无此操作")

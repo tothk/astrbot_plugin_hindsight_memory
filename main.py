@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 
 from astrbot.api.event import filter, AstrMessageEvent
@@ -12,9 +13,25 @@ from .config.plugin_paths import PluginPaths
 from .db.models.sql_model_manager import SqlModelManager
 from .core.capture import MessageCapture
 from .core.memory_service import MemoryService, format_sync_result
+from .core.persona import persona_from_conversation
 from .core.recall import prune_previous_memories
-from .core.recorder import Recorder
+from .core.recorder import Recorder, build_raw_message
 from .hindsight.plugin_config import HindsightConfig
+
+
+# 工具是**全局挂载**的：宿主在 tools 为 None 时直接遍历
+# ``get_full_tool_set()`` 把所有 active 工具挂上（见 astr_agent_tool_exec.py），
+# 工具注册也只绑 ``EventType.OnCallingFuncToolEvent``、不带任何 event_filter。
+# 因此「只服务私聊」这条约束没法用装饰器表达，只能建在工具函数内部——
+# 而且必须在任何召回/写入之前，否则成了「先读了记忆再拒绝」。
+# 这两段文本是给**模型**看的：它得知道自己做不到，才不会转头对用户说
+# 「我已经记住了」。
+_RECALL_NOT_PRIVATE = (
+    "本插件只在一对一私聊中提供记忆能力，群聊里不会把任何人的记忆读出来。"
+)
+_RETAIN_NOT_PRIVATE = (
+    "本插件只在一对一私聊中记录记忆，群聊里的发言不会被写入任何人的记忆库。"
+)
 
 
 # 插件元数据由 metadata.yaml 提供。AstrBot 3.5.19+ 会自动识别继承 Star 的插件类，
@@ -145,3 +162,119 @@ class HindsightMemory(Star):
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse):
         await self._capture.capture_reply(event, resp)
+
+    @filter.llm_tool()
+    async def proactive_recall(self, event: AstrMessageEvent, query: str) -> str:
+        """主动检索与该话题相关的既往记忆。
+
+        每轮对话前都会自动召回一次；只有当用户提到更久远、更具体的事情
+        （例如「我们之前说的那件事」），而当前上下文里没有相关记忆时，
+        才用这个工具补充检索一次。
+
+        Args:
+            query(string): 想要召回的记忆描述，用自然语言写清楚要找什么
+        """
+        # 闸门必须在召回之前：群聊里跑一次召回，等于把这一对一记忆库的内容
+        # 读进了一个多人可见的上下文。
+        if not event.is_private_chat():
+            return _RECALL_NOT_PRIVATE
+
+        query = (query or "").strip()
+        if not query:
+            return "没有提供检索内容，未召回任何记忆。"
+
+        # 复用自动召回的整条链路：它已经带了预算、类型过滤、超时与库不存在的
+        # 兜底，返回的文本也已经是可读的「【相关记忆】…」格式。
+        memory = await self._memory.recall_for(query)
+        if not memory:
+            return "没有找到相关的记忆。"
+
+        # 返回值（str）会被追加到下一次 LLM 请求里供模型参考；
+        # 这里不能返回 MessageEventResult——那会被当成「工具已直接回复用户」，
+        # 把记忆原文当作正式回复发出去，并且终止本轮 agent 循环。
+        return memory
+
+    @filter.llm_tool()
+    async def proactive_retain(
+        self, event: AstrMessageEvent, query: list[str]
+    ) -> str:
+        """主动把一段对话记录写入长期记忆。
+
+        平时对话会被自动记录并按批投递；只有当你判断某段内容值得立刻记住、
+        或发现它没被自动记录下来时，才调用这个工具补写。
+
+        Args:
+            query(list[str]): 想要写入的原始对话记录，每条字符串是一行对话
+        """
+        # 同上：写之前就挡住。群聊里的发言属于多人，落进一对一记忆库是
+        # 拿别人的话冒充这个人的过往。
+        if not event.is_private_chat():
+            return _RETAIN_NOT_PRIVATE
+
+        lines = [str(item).strip() for item in (query or []) if str(item).strip()]
+        if not lines:
+            return "没有提供要写入的内容，未写入任何记忆。"
+
+        # 整批一起写：一是省掉逐条 await 与各自的数据库事务，二是要么整批
+        # 进库、要么整批失败，不会留下「前两行进去了、后三行没有」的半批，
+        # 返回给模型的文案才能说准。
+        persona_id = await persona_from_conversation(self.context, event)
+        sender_id = event.get_sender_id()
+        sender_name = event.get_sender_name()
+        # 同一个 now：这批内容是同一次调用的产物，时间戳与 document_id 都该一致。
+        now = datetime.now()
+        rows = [
+            build_raw_message(
+                role="user",
+                sender_id=sender_id,
+                sender_name=sender_name,
+                text=line,
+                umo=event.unified_msg_origin,
+                persona_id=persona_id or "",
+                now=now,
+            )
+            for line in lines
+        ]
+
+        result = await self._recorder.save_many(
+            rows,
+            lambda: self._notify_save_failed(event),
+            # 不触发「攒够字数投一轮积压」：本函数紧接着只投这几行。
+            # 若这里也回调累加器，一旦把 pending 顶过 batch_chars，后台那轮
+            # 会把刚写的行扫走投一次，随后 sync_records 又投一次——同一段
+            # 内容在服务端文档里追加两遍，且本地多一条 SyncOperation。
+            trigger_backlog=False,
+        )
+        if not result.ok:
+            return "写入失败，本轮对话的记忆没有保存下来。"
+        if not result.rows:
+            # 全部撞上唯一索引：内容此前已经记过，不是故障。
+            return "这些内容和已有记录重复，没有新的记忆需要写入。"
+
+        saved = len(result.rows)
+
+        # 只投递刚写进去的这几行，不是库里所有积压，也不触发对账——
+        # 模型说「我记住了」，就应该只对这几句负责。
+        try:
+            outcome = await self._memory.sync_records(result.rows, trigger="主动写入")
+        except Exception as e:
+            self.logger.error(f"主动写入后投递异常: {e}")
+            return (
+                f"已记录 {saved} 条对话到本地，但投递到 Hindsight 时出错：{e}。"
+                "记录不会丢失，稍后会自动重试投递。"
+            )
+
+        if not outcome.ok:
+            return (
+                f"已记录 {saved} 条对话到本地，但投递到 Hindsight 失败：{outcome.error}。"
+                "记录不会丢失，稍后会自动重试投递。"
+            )
+        if not outcome.flushed:
+            return f"已记录 {saved} 条对话，投递已排队（服务端仍在处理中）。"
+        if result.duplicates:
+            return (
+                f"已写入 {outcome.flushed} 条对话，"
+                f"另外 {result.duplicates} 条与已有记录重复，未重复写入。"
+            )
+        return f"已将 {outcome.flushed} 条对话写入长期记忆。"
+

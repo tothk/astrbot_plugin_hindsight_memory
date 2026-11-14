@@ -26,7 +26,7 @@
   },
   "hindsight_bank_id": {
     "description": "记忆库标识（bank_id）",
-    "hint": "写入与召回都使用这个记忆库。服务端若已有数据，请填写与之相同的名字，否则会对着一片空库召回。默认 default。",
+    "hint": "写入与召回都使用这个记忆库。服务端若已有数据，请填写与之相同的名字，否则会对着一片空库召回。默认使用插件专属库名，避免与其它插件的 default 库冲突。",
     "type": "string",
     "default": "01a1c652-f619-77c9-87ab-ad9d71a5c910"
   },
@@ -53,7 +53,7 @@
     "type": "int",
     "slider": {
       "min": 1,
-      "max": 50,
+      "max": 30,
       "step": 1
     },
     "default": 5

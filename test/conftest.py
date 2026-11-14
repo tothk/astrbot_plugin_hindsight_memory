@@ -70,13 +70,17 @@ class ListLog:
 
 
 class BoomSql:
-    """每次插入都失败的假数据库，用来模拟抢不到写锁等故障。"""
+    """每次写入都失败的假数据库，用来模拟抢不到写锁等故障。"""
 
     def __init__(self, message: str = "database is locked") -> None:
         self.message = message
         self.calls = 0
 
     def insert_raw(self, raw):
+        self.calls += 1
+        raise RuntimeError(self.message)
+
+    def insert_many(self, rows):
         self.calls += 1
         raise RuntimeError(self.message)
 

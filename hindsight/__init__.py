@@ -2,7 +2,6 @@
 
 from .client import (
     RECALL_TIMEOUT,
-    RETAIN_TIMEOUT,
     HindsightAuthError,
     HindsightBankNotFoundError,
     HindsightClient,
@@ -16,7 +15,6 @@ from .client import (
 
 __all__ = [
     "RECALL_TIMEOUT",
-    "RETAIN_TIMEOUT",
     "HindsightAuthError",
     "HindsightBankNotFoundError",
     "HindsightClient",
