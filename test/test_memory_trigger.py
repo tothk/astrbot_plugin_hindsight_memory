@@ -7,7 +7,9 @@ test_hindsight_sync.py 覆盖。因此把 ``service._sync`` 换成假对象，
 
 import asyncio
 
+from astrbot_plugin_hindsight_memory.core import memory_service
 from astrbot_plugin_hindsight_memory.core.memory_service import MemoryService
+from astrbot_plugin_hindsight_memory.hindsight.client import HindsightConnectionError
 from astrbot_plugin_hindsight_memory.hindsight.plugin_config import HindsightConfig
 from astrbot_plugin_hindsight_memory.hindsight.sync import SyncOutcome
 
@@ -312,3 +314,95 @@ class TestSyncRecords:
         release.set()
         await background
         await active
+
+
+class FakeBankClient:
+    """只响应 ensure_bank 的假客户端，用来测启动时建库。"""
+
+    base_url = "http://fake-hindsight"
+    token_present = False
+
+    def __init__(self, *, created: bool = True, error: Exception | None = None):
+        self.created = created
+        self.error = error
+        self.ensure_calls: list[str] = []
+
+    async def ensure_bank(self, bank_id: str) -> bool:
+        self.ensure_calls.append(bank_id)
+        if self.error is not None:
+            raise self.error
+        return self.created
+
+    async def aclose(self) -> None:
+        return None
+
+
+class TestEnsureBankOnStart:
+    """启动时确认记忆库存在。
+
+    写入与召回共用同一个库：召回有兜底建库，但那条路要走「每轮对话前先召回」，
+    召回超时或服务不可达时这一轮不会建库，紧接着的首次投递就会撞上库缺失。
+    """
+
+    async def test_start_ensures_bank_once(self, log):
+        service, _sync = make_service(log)
+        client = FakeBankClient(created=False)
+        service._client = client
+
+        await service.start()
+        try:
+            assert client.ensure_calls == [service._config.bank_id]
+        finally:
+            await service.stop()
+
+    async def test_created_bank_is_logged(self, log):
+        service, _sync = make_service(log)
+        service._client = FakeBankClient(created=True)
+
+        await service.start()
+        try:
+            assert any("不存在，已按默认配置创建" in msg for msg in log.text_of("info"))
+        finally:
+            await service.stop()
+
+    async def test_connection_failure_does_not_block_startup(self, log):
+        # 远端此刻不可达不该阻止插件启动：记录会留在本地，恢复后补投。
+        service, _sync = make_service(log)
+        service._client = FakeBankClient(
+            error=HindsightConnectionError("连接超时")
+        )
+
+        await service.start()  # 不应抛异常
+        try:
+            assert service._task is not None, "每日补投任务仍应启动"
+            assert any("无法确认记忆库" in msg for msg in log.text_of("warning"))
+        finally:
+            await service.stop()
+
+    async def test_timeout_is_reported_and_survivable(self, log):
+        service, _sync = make_service(log)
+        release = asyncio.Event()
+
+        class SlowClient:
+            base_url = "http://fake-hindsight"
+            token_present = False
+
+            async def ensure_bank(self, bank_id: str) -> bool:
+                await release.wait()
+                return False
+
+            async def aclose(self) -> None:
+                return None
+
+        service._client = SlowClient()
+        # 把超时压到极短，避免测试真的等 5 秒。
+        original = memory_service._ENSURE_BANK_TIMEOUT
+        memory_service._ENSURE_BANK_TIMEOUT = 0.01
+        try:
+            await service.start()
+            assert service._task is not None
+            assert any("确认记忆库超时" in msg for msg in log.text_of("warning"))
+        finally:
+            release.set()
+            memory_service._ENSURE_BANK_TIMEOUT = original
+            await service.stop()

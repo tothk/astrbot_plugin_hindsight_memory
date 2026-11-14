@@ -16,13 +16,17 @@ from datetime import datetime, time, timedelta
 from typing import Sequence
 
 from ..db.models.models import RawMessage
-from ..hindsight.client import HindsightClient
+from ..hindsight.client import HindsightClient, HindsightError
 from ..hindsight.plugin_config import HindsightConfig
 from ..hindsight.sync import HindsightSync, SyncOutcome
 from .recall import recall_memories
 
 # 每日补投的默认时刻（配置 sync_daily_time 解析失败时使用）。
 _DEFAULT_DAILY = time(hour=0, minute=5)
+
+# 启动时确认记忆库存在的超时。客户端默认 30 秒，而这里是 await 的——
+# 服务不可达时不能让插件加载挂半分钟。
+_ENSURE_BANK_TIMEOUT = 5.0
 
 # 定时任务的兜底间隔：如果算出的等待时间不合理（时钟回拨、配置写错），
 # 也不要让任务睡上几天或负值空转。
@@ -129,9 +133,14 @@ class MemoryService:
         self._sync_lock = asyncio.Lock()
 
     async def start(self) -> None:
-        """启动每日补投任务。"""
+        """确认记忆库存在，然后启动每日补投任务。"""
         if self._task is not None:
             return
+        # 先确认库存在再起任务：写入与召回共用同一个库，库不存在时召回会
+        # 兜底建库，但那是「每轮对话前先召回」这条正常路径；召回超时或服务
+        # 短暂不可达时这一轮不会建库，紧接着的首次投递就可能撞上库缺失。
+        # 放在这里是一次性、幂等的，不占任何请求路径。
+        await self._ensure_bank()
         self._task = asyncio.create_task(self._daily_loop())
         # 把两个称呼也打出来：它们会写进 Hindsight 的对话文本，配错了只有从
         # 抽取出的事实里才看得出来，启动日志是最省事的核对点。
@@ -143,6 +152,33 @@ class MemoryService:
             f"称呼：用户={user_name} / AI={bot_name}"
             f"{'（已配置 Token）' if self._client.token_present else '（未配置 Token）'}"
         )
+
+    async def _ensure_bank(self) -> bool:
+        """确认记忆库存在，不存在就按默认配置建一个。
+
+        失败只记日志、返回 False：插件的主要职责是记录对话，远端此刻不可达
+        不应该阻止它启动——记录会留在本地，恢复后由每日补投或积压触发补上。
+
+        Returns:
+            库已确认存在（或刚建好）时为 True；无法确认时为 False。
+        """
+        try:
+            created = await asyncio.wait_for(
+                self._client.ensure_bank(self._config.bank_id),
+                timeout=_ENSURE_BANK_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            self._log.warning(
+                f"启动时确认记忆库超时（{_ENSURE_BANK_TIMEOUT:.0f}s），"
+                "稍后由召回或投递时补建"
+            )
+            return False
+        except HindsightError as e:
+            self._log.warning(f"启动时无法确认记忆库：{e}")
+            return False
+        if created:
+            self._log.info(f"记忆库 {self._config.bank_id!r} 不存在，已按默认配置创建")
+        return True
 
     async def stop(self) -> None:
         """取消定时任务、后台投递任务并关闭连接池。
