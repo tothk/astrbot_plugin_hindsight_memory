@@ -65,7 +65,7 @@ LLM 没有跨会话的记忆。你把历史全塞进上下文，也是几轮之�
 - **三态追踪**：`待投递 → 已入队 → 已确认`。投出去不等于记住了，得等服务端回话。
 - **自动对账**：每轮同步先查上批的状态。成功则落终态，失败先让服务端 retry（`append` 语义下重投会重复追加），屡败才退回重投。
 - **幂等提交**：`operation_id` 由本地生成、**提交前先落库**，它就是服务端的幂等键。所以无论是请求超时、进程被卸载、还是凭据写库失败，下一轮都能拿同一个 id 去问服务端要说法：查得到就等它跑完，查不到（404）就说明这批压根没送到，退回重投也不会多出一份内容。
-- **三路触发**：攒够 `sync_batch_chars` 字后台自动投、每天 `sync_daily_time` 补投一次、`/hindsight_sync` 随时手动投。
+- **五路触发**：启动时补投一轮、攒够 `sync_batch_chars` 字后台自动投、每 5 分钟对账一次、每天 `sync_daily_time` 补投一次、`/hindsight_sync` 随时手动投。
 - **只召回观察**：只向服务端要 `observation` 类型的记忆——它是对多次对话归纳出的结论，比单条事实更接近「这个人是什么样」。类型过滤在**检索阶段**生效（`types` 参数），不进入重排的候选池，所以重排开销只有全类型的一小部分。代价是刚灌完数据的库里可能还没有 observation，那几轮召回是空的。
 - **说话人消毒**：昵称里的换行和冒号会被清洗。否则一条发言能被劈成两行，甚至伪造出别人的发言人身份。
 
@@ -82,7 +82,7 @@ LLM 没有跨会话的记忆。你把历史全塞进上下文，也是几轮之�
 
 **前置**
 
-- AstrBot v4.x（插件依赖其 `on_llm_request` / `on_llm_response` 钩子）
+- AstrBot 4.29.3 及以上（插件依赖其 `on_llm_request` / `on_llm_response` 钩子）
 - 一个可访问的 Hindsight 服务（[部署文档](https://hindsight.vectorize.io)）
 - Python 3.10+（由 AstrBot 提供，插件无需额外依赖）
 
@@ -150,7 +150,7 @@ LLM 没有跨会话的记忆。你把历史全塞进上下文，也是几轮之�
 | `/hindsight_sync` 报「请求超时」 | 服务端没能在 30 秒内接下这批（`DEFAULT_TIMEOUT`）。提交是异步的，正常只花几百毫秒；一直超时说明服务过载或网络不通，先 `curl <host>:<port>/health` |
 | `/hindsight_sync` 报「HTTP 404」 | `hindsight_bank_id` 填错，或服务端从没建过这个库（插件会自动建） |
 | 「本轮没有命中记忆」一直出现 | 记录还没投递成功，或 bank 是空的；先跑一次 `/hindsight_sync` |
-| 召回到的记忆是英文的 | 服务端抽取模型的倾向问题，与插件无关，详见 [docs/hindsight-api.md](docs/hindsight-api.md) |
+| 召回到的记忆是英文的 | 服务端抽取模型的倾向问题，与插件无关。给 bank 设 `retain_mission` 可改成中文，见 [docs/hindsight-api.md 8.7 节](docs/hindsight-api.md#87-记忆事实为什么是英文的怎么改成中文) |
 | 记忆里的名字是 `user` | 配置 `user_nickname`，或确认平台能提供真实昵称 |
 
 ## 开发与测试
@@ -177,6 +177,12 @@ hindsight/  Hindsight HTTP 客户端与同步层
 config/     路径与配置（当前配置走 _conf_schema.json）
 docs/       Hindsight API 中文文档
 ```
+
+## 相关文档
+
+- [docs/hindsight-api.md](docs/hindsight-api.md)：Hindsight HTTP API 1.2.0 中文文档，含本项目对接方式（投递状态机、对账、记忆库创建、字段映射、事实语言的修改办法）
+- [CHANGELOG.md](CHANGELOG.md)：版本变更记录
+- [CONTRIBUTING.md](CONTRIBUTING.md)：提交信息规范与开发约定
 
 ## 隐私与数据安全
 
