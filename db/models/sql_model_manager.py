@@ -108,6 +108,72 @@ class SqlModelManager:
             # 唯一索引冲突：这条内容此前已经记录过，视为成功。
             return None
 
+    def _existing_hashes(self, hashes: Sequence[str]) -> set[str]:
+        """查出这些 content_hash 里已经存在于库中的那些。
+
+        Args:
+            hashes: 待检查的哈希列表，调用方需保证非空。
+
+        Returns:
+            已存在的哈希集合。
+        """
+        statement = select(RawMessage.content_hash).where(
+            RawMessage.content_hash.in_(list(hashes))
+        )
+        with Session(self._engine) as session:
+            return set(session.exec(statement))
+
+    def insert_many(self, rows: Sequence[RawMessage]) -> list[RawMessage]:
+        """在同一个事务里写入多条记录，返回真正新增的行。
+
+        不能简单 add_all + commit：``content_hash`` 上有唯一索引，只要有一条
+        重复，整批 commit 都会抛 IntegrityError 并回滚，新内容会跟着一起丢。
+        所以先把重复的筛掉（库中已有的 + 批内自重复的），剩下的放进一个事务。
+
+        Args:
+            rows: 待插入的记录列表。
+
+        Returns:
+            真正新增的记录，已带主键，顺序与传入顺序一致；全部重复时为空列表。
+
+        Note:
+            筛选与插入之间仍有窗口：另一个进程可能恰好插入了同样的内容。
+            那种情况 commit 会抛 IntegrityError，这里退回逐条插入，
+            至少保住不重复的那部分——批量在单进程下是常态，这个兜底
+            几乎不会走到，但走到时不能整批丢。
+        """
+        if not rows:
+            return []
+
+        wanted = list(dict.fromkeys(raw.content_hash for raw in rows))
+        existing = self._existing_hashes(wanted)
+
+        fresh: list[RawMessage] = []
+        seen: set[str] = set()
+        for raw in rows:
+            key = raw.content_hash
+            if key in existing or key in seen:
+                continue
+            seen.add(key)
+            fresh.append(raw)
+
+        if not fresh:
+            return []
+
+        try:
+            with Session(self._engine, expire_on_commit=False) as session:
+                session.add_all(fresh)
+                session.commit()
+            return fresh
+        except IntegrityError:
+            # 竞态：筛选之后有人抢先插了同样的内容。退回逐条写，能写几条算几条。
+            inserted: list[RawMessage] = []
+            for raw in fresh:
+                saved = self.insert_raw(raw)
+                if saved is not None:
+                    inserted.append(saved)
+            return inserted
+
     def list_unflushed(self, limit: int = 1000) -> list[RawMessage]:
         """按 id 升序取出尚未提交给 Hindsight 的记录。
 
@@ -118,7 +184,9 @@ class SqlModelManager:
         正在等服务端确认，再投一次会在文档末尾重复追加。
 
         Args:
-            limit: 最多取多少条，防止积压过多时一次性读进内存。
+            limit: 最多取多少条，防止积压过多时一次性读进内存。默认值与
+                ``hindsight.sync._DEFAULT_PENDING_LIMIT`` 保持一致：这个
+                默认值只是给直接调用留的方便，正常路径由同步层显式传入。
 
         Returns:
             尚未提交的记录列表，按 id 升序；没有则返回空列表。

@@ -4,6 +4,8 @@
 （按 id 升序、只取待投递、三态转换、批次区间回写）正是要靠真实 SQL 才能验证的。
 """
 
+from sqlmodel import Session, select
+
 from astrbot_plugin_hindsight_memory.db.models.models import (
     FLUSHED_DONE,
     FLUSHED_ENQUEUED,
@@ -187,6 +189,69 @@ class TestEnqueueAndResolve:
             "op-二",
             "op-三",
         ]
+
+
+class TestInsertMany:
+    """批量写入：一次事务写多行，并把判重结果如实报出来。"""
+
+    def test_writes_all_rows(self, sql) -> None:
+        rows = [make_raw(text="一"), make_raw(text="二"), make_raw(text="三")]
+
+        inserted = sql.insert_many(rows)
+
+        assert [row.raw_message for row in inserted] == ["一", "二", "三"]
+        assert all(row.id is not None for row in inserted)
+        assert len(sql.list_unflushed()) == 3
+
+    def test_empty_input_writes_nothing(self, sql) -> None:
+        assert sql.insert_many([]) == []
+        assert sql.list_unflushed() == []
+
+    def test_duplicate_in_database_is_filtered_out(self, sql) -> None:
+        # 库里已有的内容不该再写一遍，也不该算成失败。
+        sql.insert_raw(make_raw(text="已经记过"))
+
+        inserted = sql.insert_many([make_raw(text="已经记过"), make_raw(text="新的")])
+
+        assert [row.raw_message for row in inserted] == ["新的"]
+        with Session(sql._engine) as session:
+            assert len(session.exec(select(RawMessage)).all()) == 2
+
+    def test_duplicate_inside_the_batch_is_filtered_out(self, sql) -> None:
+        # 同一批里重复的内容也只能进一行：走的是同一条唯一索引。
+        inserted = sql.insert_many([make_raw(text="同一句"), make_raw(text="同一句")])
+
+        assert [row.raw_message for row in inserted] == ["同一句"]
+
+    def test_all_duplicates_returns_empty_list(self, sql) -> None:
+        sql.insert_raw(make_raw(text="旧的"))
+
+        inserted = sql.insert_many([make_raw(text="旧的"), make_raw(text="旧的")])
+
+        assert inserted == []
+
+    def test_committed_rows_keep_their_attributes(self, sql) -> None:
+        # expire_on_commit=False 的理由：commit 后对象还要被调用方拿去投递，
+        # 过期了就得为每个字段重新查库（而且是隐式 IO）。
+        inserted = sql.insert_many([make_raw(text="别过期")])
+
+        row = inserted[0]
+        assert row.raw_message == "别过期"
+        assert row.sender_id == "10001"
+        assert row.content_hash == "hash-别过期"
+
+    def test_integrity_error_falls_back_to_single_inserts(self, sql, monkeypatch) -> None:
+        # 竞态：筛选之后、commit 之前，别人抢先插入了同样的内容。
+        # 这里把「查重」屏蔽掉来复现那个窗口，再让真实唯一索引把 commit 打回来。
+        sql.insert_raw(make_raw(text="抢先一步"))
+        monkeypatch.setattr(sql, "_existing_hashes", lambda hashes: set())
+
+        inserted = sql.insert_many([make_raw(text="抢先一步"), make_raw(text="新的")])
+
+        # 整批没有丢：撞上的当作重复丢弃，其余照常写入。
+        assert [row.raw_message for row in inserted] == ["新的"]
+        with Session(sql._engine) as session:
+            assert len(session.exec(select(RawMessage)).all()) == 2
 
 
 class TestRoundTripWithSync:
