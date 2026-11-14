@@ -76,9 +76,12 @@ class FakeRecorder:
 
 
 class FakeEvent:
-    """工具只用到会话标识与发送者信息。"""
+    """工具只用到会话标识、发送者信息与私聊/群聊判定。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, private: bool = True) -> None:
+        # 默认私聊：绝大多数用例的前提是「在一对一场景下正常工作」，
+        # 群聊用例显式传 private=False 来钉住闸门。
+        self.private = private
         self.unified_msg_origin = "qq_official:FriendMessage:u1"
         self._sender_id = "10001"
         self._sender_name = "小满"
@@ -88,6 +91,9 @@ class FakeEvent:
 
     def get_sender_name(self) -> str:
         return self._sender_name
+
+    def is_private_chat(self) -> bool:
+        return self.private
 
 
 class FakeSelf:
@@ -113,6 +119,66 @@ def stub_persona(monkeypatch):
         return "default"
 
     monkeypatch.setattr(plugin_main, "persona_from_conversation", fake_persona)
+
+
+class TestPrivateChatOnly:
+    """工具是全局挂载的，私聊闸门只能建在函数内部，这里钉住它。"""
+
+    async def test_recall_refuses_in_group_chat(self) -> None:
+        memory = FakeMemory()
+        fake = make_self(memory)
+
+        result = await HindsightMemory.proactive_recall(
+            fake, FakeEvent(private=False), "她最近怎么样"
+        )
+
+        # 关键：一次服务端请求都没发——不能「先读了记忆再拒绝」。
+        assert memory.queries == []
+        assert result == plugin_main._RECALL_NOT_PRIVATE
+        assert "群聊" in result and "私聊" in result
+
+    async def test_retain_refuses_in_group_chat(self) -> None:
+        memory = FakeMemory()
+        recorder = FakeRecorder()
+        fake = make_self(memory, recorder)
+
+        result = await HindsightMemory.proactive_retain(
+            fake, FakeEvent(private=False), ["群里某个人说的话"]
+        )
+
+        # 一行都不能落库：拿别人的话冒充这个人的过往。
+        assert recorder.batches == []
+        assert memory.sync_calls == []
+        assert result == plugin_main._RETAIN_NOT_PRIVATE
+        assert "群聊" in result and "私聊" in result
+
+    async def test_group_gate_runs_before_query_validation(self) -> None:
+        # 空 query 也应该是「群聊不支持」，而不是「没有提供内容」——
+        # 后者会让模型以为换个 query 就能用。
+        fake = make_self()
+
+        recall = await HindsightMemory.proactive_recall(
+            fake, FakeEvent(private=False), "  "
+        )
+        retain = await HindsightMemory.proactive_retain(
+            fake, FakeEvent(private=False), []
+        )
+
+        assert recall == plugin_main._RECALL_NOT_PRIVATE
+        assert retain == plugin_main._RETAIN_NOT_PRIVATE
+
+    async def test_gate_does_not_block_private_chat(self) -> None:
+        fake = make_self()
+
+        recall = await HindsightMemory.proactive_recall(
+            fake, FakeEvent(private=True), "她最近怎么样"
+        )
+        retain = await HindsightMemory.proactive_retain(
+            fake, FakeEvent(private=True), ["一句话"]
+        )
+
+        assert recall == MEMORY
+        assert "已将" in retain
 
 
 class TestProactiveRecall:

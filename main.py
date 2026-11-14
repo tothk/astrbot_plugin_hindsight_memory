@@ -19,6 +19,21 @@ from .core.recorder import Recorder, build_raw_message
 from .hindsight.plugin_config import HindsightConfig
 
 
+# 工具是**全局挂载**的：宿主在 tools 为 None 时直接遍历
+# ``get_full_tool_set()`` 把所有 active 工具挂上（见 astr_agent_tool_exec.py），
+# 工具注册也只绑 ``EventType.OnCallingFuncToolEvent``、不带任何 event_filter。
+# 因此「只服务私聊」这条约束没法用装饰器表达，只能建在工具函数内部——
+# 而且必须在任何召回/写入之前，否则成了「先读了记忆再拒绝」。
+# 这两段文本是给**模型**看的：它得知道自己做不到，才不会转头对用户说
+# 「我已经记住了」。
+_RECALL_NOT_PRIVATE = (
+    "本插件只在一对一私聊中提供记忆能力，群聊里不会把任何人的记忆读出来。"
+)
+_RETAIN_NOT_PRIVATE = (
+    "本插件只在一对一私聊中记录记忆，群聊里的发言不会被写入任何人的记忆库。"
+)
+
+
 # 插件元数据由 metadata.yaml 提供。AstrBot 3.5.19+ 会自动识别继承 Star 的插件类，
 # 已废弃的 @register 装饰器不再使用，避免宿主未来移除它时插件无法加载。
 class HindsightMemory(Star):
@@ -159,6 +174,11 @@ class HindsightMemory(Star):
         Args:
             query(string): 想要召回的记忆描述，用自然语言写清楚要找什么
         """
+        # 闸门必须在召回之前：群聊里跑一次召回，等于把这一对一记忆库的内容
+        # 读进了一个多人可见的上下文。
+        if not event.is_private_chat():
+            return _RECALL_NOT_PRIVATE
+
         query = (query or "").strip()
         if not query:
             return "没有提供检索内容，未召回任何记忆。"
@@ -186,6 +206,11 @@ class HindsightMemory(Star):
         Args:
             query(list[str]): 想要写入的原始对话记录，每条字符串是一行对话
         """
+        # 同上：写之前就挡住。群聊里的发言属于多人，落进一对一记忆库是
+        # 拿别人的话冒充这个人的过往。
+        if not event.is_private_chat():
+            return _RETAIN_NOT_PRIVATE
+
         lines = [str(item).strip() for item in (query or []) if str(item).strip()]
         if not lines:
             return "没有提供要写入的内容，未写入任何记忆。"
