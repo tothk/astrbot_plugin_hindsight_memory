@@ -177,11 +177,11 @@ class TestSaveFailure:
         await recorder.save(make_raw(), notify)
         assert notify.calls == 1
 
-        sql.insert_raw = lambda raw: raw  # 模拟恢复正常
+        sql.insert_many = lambda rows: list(rows)  # 模拟恢复正常
         await recorder.save(make_raw(text="恢复了"), notify)
         assert notify.calls == 1
 
-        sql.insert_raw = BoomSql().insert_raw  # 再次故障
+        sql.insert_many = BoomSql().insert_many  # 再次故障
         await recorder.save(make_raw(text="又坏了"), notify)
         assert notify.calls == 2
 
