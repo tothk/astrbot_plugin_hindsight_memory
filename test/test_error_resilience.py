@@ -32,8 +32,9 @@ class BaseStore:
     def mark_flushed(self, ids, value: int = 2) -> int:
         return len(list(ids))
 
-    def mark_enqueued(self, ids, *, operation_id: str, items_count: int = 0) -> int:
-        return len(list(ids))
+    def mark_enqueued(self, ids, *, operation_id: str, items_count: int = 0) -> list:
+        # 认领语义：返回真正拿到的行，调用方据此过滤原批次。
+        return list(ids)
 
     def pending_operations(self, limit: int = 100):
         return []
@@ -129,7 +130,8 @@ class TestStoreFailuresBecomeOutcome:
 
             def mark_enqueued(self, ids, *, operation_id, items_count=0):
                 self.enqueued.append((list(ids), operation_id))
-                return 1
+                # 认领语义：返回真正拿到的主键列表，不是行数。
+                return list(ids)
 
             def release_operation(self, operation_id):
                 self.released.append(operation_id)
@@ -166,7 +168,7 @@ class TestStoreFailuresBecomeOutcome:
 
             def mark_enqueued(self, ids, *, operation_id, items_count=0):
                 self.enqueued.append(operation_id)
-                return 1
+                return list(ids)
 
             def mark_flushed(self, ids, value: int = 2):
                 self.flushed_marks.append((list(ids), value))

@@ -297,8 +297,12 @@ class SyncStore(Protocol):
         *,
         operation_id: str,
         items_count: int = 0,
-    ) -> int:
-        """把一批记录标为「已入队」并写下操作凭据。"""
+    ) -> list[int]:
+        """认领一批仍处于待投递状态的记录，并写下操作凭据。
+
+        Returns:
+            实际认领到的主键列表；已被其它同步轮次取走的行不在其中。
+        """
         ...
 
     def pending_operations(self, limit: int = 100) -> list[SyncOperation]:
@@ -645,9 +649,14 @@ class HindsightSync:
             投递阶段的摘要，字段含义与 ``submit()`` 相同。
 
         Note:
-            调用方必须持有与 ``run()`` 相同的锁，否则后台的积压投递可能同时
-            把同一批行取走并标成已入队，两边各生成一个 ``operation_id``，
-            ``append`` 语义下不会去重，文档里就多出一份。
+            这里只投递**仍处于待投递状态**的记录。从调用方写库到本方法执行
+            之间有一段窗口，每日补投、手动指令或别的会话的积压触发都可能先
+            把那批行取走并投出去；认领是条件更新（只承认 ``flushed`` 仍为
+            待投递的行），因此已被取走的部分会被静默跳过，不会重复追加。
+
+            这个保证来自数据库语句本身，不依赖调用方持锁。层内的
+            ``_sync_lock`` 只负责让同一个进程里的几路触发不并行，对别的
+            AstrBot 实例或手工打开的 sqlite 客户端无效。
         """
         if not records:
             return SyncOutcome()
@@ -667,23 +676,26 @@ class HindsightSync:
             ``flushed``（成功入队的条数），失败时 ``error`` 非空。
 
         Note:
-            顺序是「先落库、后提交」，不能反过来。以前是先提交、拿到
-            ``operation_id`` 才写进本地，于是「服务端已排队、凭据没落库」这个
-            窗口里的崩溃会让这一批停在待投递，下一轮换个新 uuid 重投，文档里
-            就多了一份。
+            顺序是「先认领、再装配、后提交」，三步都不能换位：
 
-            反过来的代价是「本地记了、服务端没收到」，但那种情况在下一轮对账时
-            会稳定地拿到 404——既然提交时用的就是本地记下的那个 id，404 就只能
-            意味着服务端从没收到过，退回重投是安全的。
+            1. **先认领**。``mark_enqueued`` 只把仍处于待投递的行改成已入队，
+               并返回真正认领到的主键。这个条件更新是原子的，所以「写库 →
+               本方法执行」那段窗口里被别的同步轮次取走的行不会被投第二次。
+            2. **再装配**。只把认领到的行交给 ``build_items``，否则会把别人的
+               行也拼进这次的文档。
+            3. **后提交**。凭据必须在请求之前落库：以前是先提交、拿到
+               ``operation_id`` 才写进本地，于是「服务端已排队、凭据没落库」
+               这个窗口里的崩溃会让这一批停在待投递，下一轮换个新 uuid 重投，
+               文档里就多了一份。反过来的代价是「本地记了、服务端没收到」，
+               但那种情况在下一轮对账时会稳定地拿到 404——既然提交时用的就是
+               本地记下的那个 id，404 就只能意味着服务端从没收到过，退回重投
+               是安全的。
         """
         batches = split_batches(pending, self._max_chars)
         documents = 0
         flushed = 0
 
         for index, batch in enumerate(batches, start=1):
-            items = build_items(
-                batch, user_name=self._user_name, bot_name=self._bot_name
-            )
             ids = [raw.id for raw in batch if raw.id is not None]
             awaited = f"第 {index}/{len(batches)} 批"
 
@@ -693,11 +705,15 @@ class HindsightSync:
             operation_id = str(uuid.uuid4())
 
             try:
-                await asyncio.to_thread(
+                # 先认领、再装配。认领是条件更新（只承认仍处于待投递的行），
+                # 所以「写入 → 获锁」这段窗口里被别的同步轮次取走的行不会被
+                # 重复投第二次。必须在 build_items 之前执行：只该把真正认领
+                # 到的行交给服务端。
+                claimed = await asyncio.to_thread(
                     self._store.mark_enqueued,
                     ids,
                     operation_id=operation_id,
-                    items_count=len(items),
+                    items_count=len(batch),
                 )
             except Exception as exc:
                 # 凭据都没落库，请求也就不用发了：记录还是待投递，什么都没发生。
@@ -709,6 +725,27 @@ class HindsightSync:
                     flushed=flushed,
                     error=f"本地数据库异常：{exc}",
                 )
+
+            if not claimed:
+                # 一条都没认领到：这批已被别的同步轮次取走并提交过。
+                # 不是错误，跳过即可——别的批次可能还有机会，不能 return。
+                self._log.debug(
+                    f"{awaited} 没有可认领的记录（已被其它同步轮次处理），跳过"
+                )
+                continue
+
+            if len(claimed) < len(ids):
+                self._log.info(
+                    f"{awaited} 部分记录已被其它同步轮次认领，"
+                    f"本次只提交 {len(claimed)}/{len(ids)} 条"
+                )
+
+            claimed_set = set(claimed)
+            batch = [raw for raw in batch if raw.id in claimed_set]
+            ids = claimed
+            items = build_items(
+                batch, user_name=self._user_name, bot_name=self._bot_name
+            )
 
             try:
                 result = await self._client.retain(

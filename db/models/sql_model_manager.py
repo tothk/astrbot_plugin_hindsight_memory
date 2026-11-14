@@ -235,54 +235,82 @@ class SqlModelManager:
         batch_key: str = "",
         items_count: int = 0,
         error: str = "",
-    ) -> int:
-        """把一批记录标记为「已入队」，并写下对账所需的操作凭据。
+    ) -> list[int]:
+        """认领一批记录（待投递 → 已入队），并写下对账所需的操作凭据。
 
-        这两件事必须一起做，所以放在同一个事务里：只标 ``flushed`` 而不记
-        ``operation_id``，日后就无从知道该向服务端问哪一批；只记凭据而不标
-        ``flushed``，下一轮会把同一批内容再投一次。
+        只认领仍处于「待投递」的记录：``WHERE flushed = FLUSHED_PENDING``
+        与状态变更是同一条 UPDATE 完成的，所以在语句层面就是原子的。这一点
+        比进程内的锁更强——别的 ``sync_once``、另一个 AstrBot 实例、乃至手工
+        打开的 sqlite 客户端，都拿不到同一批行的写锁。
+
+        为什么必须这么判：调用方（以及主动写入那条路径）是「先写库、后获锁
+        再投递」，两者之间敞着一个窗口，每日补投、手动指令、别的会话的积压
+        触发都可能在这个窗口里把这批行扫走并投出去。如果这里无条件更新，
+        后到的调用方会把已被投递的行再投一遍（``append`` 语义下内容重复），
+        甚至把已经落成「已完成」的行改回「已入队」，造出一个永远等不到对账
+        的中间态。
 
         Args:
-            ids: 本批覆盖的记录主键，必须非空。
+            ids: 本批候选的记录主键，必须非空。
             operation_id: 服务端返回的操作标识（父操作）。
             batch_key: 本地批次标识，仅用于日志与排错。
             items_count: 本批提交的 item 数量。
             error: 入队阶段通常为空，预留接口。
 
         Returns:
-            实际更新为「已入队」的行数；ids 为空时返回 0 且不写记录。
+            实际认领到的主键列表，按传入顺序；一个都没认领到时为空列表，
+            此时**不会**写下 ``SyncOperation`` 记录——凭据表描述的是「这一次
+            到底提交了什么」，没提交就不该留痕。
         """
-        id_list = [int(i) for i in ids if i is not None]
-        if not id_list:
-            return 0
+        wanted = [int(i) for i in ids if i is not None]
+        if not wanted:
+            return []
 
-        now = datetime.now().astimezone().isoformat(timespec="seconds")
-        record = SyncOperation(
-            operation_id=operation_id,
-            first_row_id=min(id_list),
-            last_row_id=max(id_list),
-            items_count=items_count,
-            status="pending",
-            error=error,
-            created_at=now,
-            updated_at=now,
-        )
         with Session(self._engine) as session:
-            session.add(record)
             statement = (
                 update(RawMessage)
-                .where(RawMessage.id.in_(id_list))
+                .where(
+                    RawMessage.id.in_(wanted),
+                    RawMessage.flushed == FLUSHED_PENDING,
+                )
                 .values(flushed=FLUSHED_ENQUEUED)
+                # RETURNING 让「改了哪几行」和「改成了什么」出自同一条语句，
+                # 不必再查一次（再查一次就又有了窗口）。
+                .returning(RawMessage.id)
             )
-            result = session.execute(statement)
+            claimed = [row[0] for row in session.execute(statement).fetchall()]
+            if not claimed:
+                session.commit()
+                return []
+
+            # 保持传入顺序，方便调用方按认领结果过滤原批次。
+            claimed_set = set(claimed)
+            ordered = [i for i in wanted if i in claimed_set]
+
+            now = datetime.now().astimezone().isoformat(timespec="seconds")
+            session.add(
+                SyncOperation(
+                    operation_id=operation_id,
+                    # 区间取实际认领到的行，可能窄于原批次。
+                    first_row_id=min(ordered),
+                    last_row_id=max(ordered),
+                    items_count=items_count,
+                    status="pending",
+                    error=error,
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
             session.commit()
-            updated = result.rowcount or 0
 
         if self._log is not None:
+            skipped = len(wanted) - len(ordered)
+            suffix = f"，跳过 {skipped} 条已被其它同步轮次认领" if skipped else ""
             self._log.info(
-                f"已入队 {updated} 条记录 → operation={operation_id} batch={batch_key or '-'}"
+                f"已认领 {len(ordered)} 条记录 → operation={operation_id} "
+                f"batch={batch_key or '-'}{suffix}"
             )
-        return updated
+        return ordered
 
     def pending_operations(self, limit: int = 100) -> list[SyncOperation]:
         """取出还没有结论的提交批次，按创建顺序。

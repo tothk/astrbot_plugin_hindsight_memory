@@ -115,10 +115,12 @@ class TestEnqueueAndResolve:
     def test_mark_enqueued_writes_batch_record(self, sql) -> None:
         first = sql.insert_raw(make_raw(text="一"))
         second = sql.insert_raw(make_raw(text="二"))
-        updated = sql.mark_enqueued(
+        claimed = sql.mark_enqueued(
             [first.id, second.id], operation_id="op-1", items_count=1
         )
-        assert updated == 2
+        # 返回值是「认领到的主键」而不是行数：调用方要据此过滤原批次，
+        # 只把真正属于这一次的行交给服务端。
+        assert claimed == [first.id, second.id]
         # 记录变成「已入队」，不再出现在待投递里
         assert sql.list_unflushed() == []
         # 批次凭据被写了下来，巡检才知道该问哪个 operation
@@ -129,8 +131,45 @@ class TestEnqueueAndResolve:
         assert pending[0].last_row_id == second.id
 
     def test_mark_enqueued_empty_ids_is_noop(self, sql) -> None:
-        assert sql.mark_enqueued([], operation_id="op-1") == 0
+        assert sql.mark_enqueued([], operation_id="op-1") == []
         assert sql.pending_operations() == []
+
+    def test_mark_enqueued_skips_rows_claimed_elsewhere(self, sql) -> None:
+        """已被别的同步轮次取走的行不再认领，否则会被投第二次。"""
+        first = sql.insert_raw(make_raw(text="一"))
+        second = sql.insert_raw(make_raw(text="二"))
+        # 模拟另一路已经把这批行标成「已入队」并提交
+        assert sql.mark_enqueued([first.id], operation_id="op-other") == [first.id]
+
+        # 后到的一路拿着同一批 id 来认领：第一行不该被它拿走
+        claimed = sql.mark_enqueued(
+            [first.id, second.id], operation_id="op-late"
+        )
+        assert claimed == [second.id]
+        # 凭据表的行号区间也只覆盖真正认领到的那一段
+        late = [op for op in sql.pending_operations() if op.operation_id == "op-late"]
+        assert len(late) == 1
+        assert late[0].first_row_id == second.id
+        assert late[0].last_row_id == second.id
+
+    def test_mark_enqueued_returns_empty_when_all_claimed(self, sql) -> None:
+        """一条都没认领到时不写凭据——没提交就不该留痕。"""
+        first = sql.insert_raw(make_raw(text="一"))
+        sql.mark_enqueued([first.id], operation_id="op-other")
+
+        assert sql.mark_enqueued([first.id], operation_id="op-late") == []
+        # 仍然只有先到那一路的凭据
+        assert [op.operation_id for op in sql.pending_operations()] == ["op-other"]
+
+    def test_mark_enqueued_never_revives_done_rows(self, sql) -> None:
+        """已完成的行不能被后到的认领改回「已入队」中间态。"""
+        first = sql.insert_raw(make_raw(text="一"))
+        sql.mark_enqueued([first.id], operation_id="op-1")
+        sql.resolve_operation("op-1", status="completed")
+        assert sql.count_by_flushed() == {FLUSHED_DONE: 1}
+
+        assert sql.mark_enqueued([first.id], operation_id="op-2") == []
+        assert sql.count_by_flushed() == {FLUSHED_DONE: 1}
 
     def test_resolve_completed_marks_rows_done(self, sql) -> None:
         first = sql.insert_raw(make_raw(text="一"))

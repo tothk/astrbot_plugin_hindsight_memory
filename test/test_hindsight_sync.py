@@ -222,6 +222,8 @@ class FakeStore:
     resolved: list[tuple[str, str]] | None = None
     released: list[str] | None = None
     operations: list = field(default_factory=list)
+    # 已被「别的同步轮次」抢走的主键：mark_enqueued 不会认领它们。
+    taken: list[int] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.marked = []
@@ -236,10 +238,12 @@ class FakeStore:
         self.marked.extend(ids)
         return len(ids)
 
-    def mark_enqueued(self, ids, *, operation_id: str, items_count: int = 0) -> int:
-        id_list = list(ids)
+    def mark_enqueued(self, ids, *, operation_id: str, items_count: int = 0) -> list[int]:
+        # 真实实现只认领仍待投递的行，返回认领到的主键；这里默认全部认领，
+        # 需要模拟「被别的同步轮次抢先取走」的用例再用 taken 显式限定。
+        id_list = [int(i) for i in ids if i not in self.taken]
         self.enqueued.append((id_list, operation_id))
-        return len(id_list)
+        return id_list
 
     def pending_operations(self, limit: int = 100) -> list:
         return self.operations[:limit]
