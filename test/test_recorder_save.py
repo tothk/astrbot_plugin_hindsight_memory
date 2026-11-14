@@ -145,6 +145,43 @@ class TestSaveCallback:
         assert await recorder.save(make_raw(), Notifier()) is True
 
 
+class TestTriggerBacklogFlag:
+    """攒字数触发器可以按调用方关掉。"""
+
+    async def test_save_many_can_skip_the_callback(self, sql, log: ListLog):
+        # 调用方紧接着要自己投递这几行时，必须关掉这个回调：
+        # 否则后台那轮会把刚写的行扫走投一次，调用方又投一次，内容翻倍。
+        lengths = []
+        recorder = Recorder(sql, log, lengths.append)
+
+        await recorder.save_many(
+            [make_raw(text="一二三")], Notifier(), trigger_backlog=False
+        )
+
+        assert lengths == []
+
+    async def test_skipping_still_writes_the_rows(self, sql, log: ListLog):
+        recorder = Recorder(sql, log, lambda _length: None)
+
+        result = await recorder.save_many(
+            [make_raw(text="一二三")], Notifier(), trigger_backlog=False
+        )
+
+        # 关掉的只是「通知上层」，不是写入本身。
+        assert result.ok is True
+        assert len(result.rows) == 1
+        with Session(sql._engine) as session:
+            assert len(session.exec(select(RawMessage)).all()) == 1
+
+    async def test_default_still_triggers(self, sql, log: ListLog):
+        lengths = []
+        recorder = Recorder(sql, log, lengths.append)
+
+        await recorder.save_many([make_raw(text="一二三")], Notifier())
+
+        assert lengths == [3]
+
+
 class TestSaveFailure:
     async def test_failure_returns_false_and_notifies(self, log: ListLog):
         recorder = Recorder(BoomSql(), log)

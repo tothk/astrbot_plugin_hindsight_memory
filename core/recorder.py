@@ -323,7 +323,11 @@ class Recorder:
             self._log.error(f"记录成功后的回调失败: {e}")
 
     async def save_many(
-        self, rows: Sequence[RawMessage], notify: Callable[[], Awaitable[None]]
+        self,
+        rows: Sequence[RawMessage],
+        notify: Callable[[], Awaitable[None]],
+        *,
+        trigger_backlog: bool = True,
     ) -> SaveResult:
         """在一个事务里写入多条记录。
 
@@ -334,6 +338,11 @@ class Recorder:
         Args:
             rows: 待落库的记录列表。
             notify: 失败时调用的异步通知回调，只在首次失败时触发。
+            trigger_backlog: 是否把新增正文的长度报给 ``on_saved``。那是个
+                「攒够字数就投一轮全库积压」的触发器。调用方**紧接着要亲自
+                投递这几行**时必须传 False（见 ``proactive_retain``）：否则
+                累加器一旦被顶过阈值，后台那轮会先把手头这几行扫走并投一次，
+                紧接着调用方又投一次，同一段内容在文档里追加两遍。
 
         Returns:
             写入结果：新增的行、被判重的条数、以及写库是否成功。
@@ -375,7 +384,8 @@ class Recorder:
         # 攒字数触发只报一次，报新增正文的总长度而不是逐条报：
         # 下游 note_saved() 本来就是累加器，一次加总与多次累加等价，
         # 但少了几次调用，也不会因为中途异常而只加了一半。
-        self._notify_saved(sum(len(raw.raw_message) for raw in inserted))
+        if trigger_backlog:
+            self._notify_saved(sum(len(raw.raw_message) for raw in inserted))
         return SaveResult(rows=tuple(inserted), duplicates=duplicates, ok=True)
 
     async def save(self, raw: RawMessage, notify: Callable[[], Awaitable[None]]) -> bool:

@@ -58,9 +58,11 @@ class FakeRecorder:
         self.result = result
         self.duplicates = duplicates
         self.batches: list[list] = []
+        self.trigger_backlog: bool | None = None
 
-    async def save_many(self, rows, notify):
+    async def save_many(self, rows, notify, *, trigger_backlog: bool = True):
         self.batches.append(list(rows))
+        self.trigger_backlog = trigger_backlog
         if self.result == "fail":
             return SaveResult(rows=(), duplicates=0, ok=False)
         if self.result == "duplicate":
@@ -235,6 +237,16 @@ class TestProactiveRetain:
         assert rows[0].message_sent_time == rows[1].message_sent_time
         assert memory.sync_calls == ["主动写入"]
         assert "已将 1 条对话写入长期记忆" in result
+
+    async def test_does_not_trigger_backlog_submission(self) -> None:
+        # 关键约束：工具紧接着要自己投这几行，绝不能让「攒够字数投一轮积压」
+        # 的触发器也跑一遍——两条路径都会读同一批行，内容会被 append 两遍。
+        recorder = FakeRecorder()
+        fake = make_self(FakeMemory(), recorder)
+
+        await HindsightMemory.proactive_retain(fake, FakeEvent(), ["一句话"])
+
+        assert recorder.trigger_backlog is False
 
     async def test_only_the_new_rows_are_submitted(self) -> None:
         # 关键约束：投递的必须就是刚写进去的这几行，不是库里所有积压。

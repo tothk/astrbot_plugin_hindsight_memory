@@ -237,7 +237,13 @@ class HindsightMemory(Star):
         ]
 
         result = await self._recorder.save_many(
-            rows, lambda: self._notify_save_failed(event)
+            rows,
+            lambda: self._notify_save_failed(event),
+            # 不触发「攒够字数投一轮积压」：本函数紧接着只投这几行。
+            # 若这里也回调累加器，一旦把 pending 顶过 batch_chars，后台那轮
+            # 会把刚写的行扫走投一次，随后 sync_records 又投一次——同一段
+            # 内容在服务端文档里追加两遍，且本地多一条 SyncOperation。
+            trigger_backlog=False,
         )
         if not result.ok:
             return "写入失败，本轮对话的记忆没有保存下来。"
