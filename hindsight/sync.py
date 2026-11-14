@@ -296,7 +296,6 @@ class SyncStore(Protocol):
         ids: Sequence[int],
         *,
         operation_id: str,
-        items_count: int = 0,
     ) -> list[int]:
         """认领一批仍处于待投递状态的记录，并写下操作凭据。
 
@@ -507,8 +506,16 @@ class HindsightSync:
                     self._log.error(f"标记批次完成失败（{operation_id}）：{exc}")
                     continue
                 completed += 1
+                # 报「实际落地几行 / 认领时几行」两个数：只报一个总数时，
+                # 回写少了也看不出来，正是区间串批次那个 bug 长期隐身的原因。
+                expected = getattr(record, "items_count", 0)
+                landed = (
+                    f"{resolved}/{expected} 条"
+                    if expected
+                    else f"{resolved} 条"
+                )
                 self._log.info(
-                    f"对账完成：operation={operation_id} {resolved} 条记录已确认落地"
+                    f"对账完成：operation={operation_id} {landed}记录已确认落地"
                 )
                 continue
 
@@ -713,7 +720,6 @@ class HindsightSync:
                     self._store.mark_enqueued,
                     ids,
                     operation_id=operation_id,
-                    items_count=len(batch),
                 )
             except Exception as exc:
                 # 凭据都没落库，请求也就不用发了：记录还是待投递，什么都没发生。

@@ -233,7 +233,6 @@ class SqlModelManager:
         *,
         operation_id: str,
         batch_key: str = "",
-        items_count: int = 0,
         error: str = "",
     ) -> list[int]:
         """认领一批记录（待投递 → 已入队），并写下对账所需的操作凭据。
@@ -254,7 +253,6 @@ class SqlModelManager:
             ids: 本批候选的记录主键，必须非空。
             operation_id: 服务端返回的操作标识（父操作）。
             batch_key: 本地批次标识，仅用于日志与排错。
-            items_count: 本批提交的 item 数量。
             error: 入队阶段通常为空，预留接口。
 
         Returns:
@@ -273,7 +271,12 @@ class SqlModelManager:
                     RawMessage.id.in_(wanted),
                     RawMessage.flushed == FLUSHED_PENDING,
                 )
-                .values(flushed=FLUSHED_ENQUEUED)
+                .values(
+                    flushed=FLUSHED_ENQUEUED,
+                    # 归属与状态在同一条 UPDATE 里写下：对账时按归属回写，
+                    # 不必再靠 id 区间反推（区间会串到别的批次）。
+                    operation_id=operation_id,
+                )
                 # RETURNING 让「改了哪几行」和「改成了什么」出自同一条语句，
                 # 不必再查一次（再查一次就又有了窗口）。
                 .returning(RawMessage.id)
@@ -291,10 +294,15 @@ class SqlModelManager:
             session.add(
                 SyncOperation(
                     operation_id=operation_id,
-                    # 区间取实际认领到的行，可能窄于原批次。
+                    # 区间取实际认领到的行，可能窄于原批次。仅用于日志与排错，
+                    # 归属判断一律走 RawMessage.operation_id。
                     first_row_id=min(ordered),
                     last_row_id=max(ordered),
-                    items_count=items_count,
+                    # 记「实际认领到的行数」而不是调用方给的 items_count：
+                    # 部分认领是正常路径（同一批被别的同步轮次抢先拿走一部分），
+                    # 按调用方的数字记，对账时会把这种正常情况误报成
+                    # 「回写行数与认领时不一致」。
+                    items_count=len(ordered),
                     status="pending",
                     error=error,
                     created_at=now,
@@ -347,8 +355,8 @@ class SqlModelManager:
     ) -> int:
         """记录某个批次的处理结论，并按结论改写这批记录的状态。
 
-        ``completed`` 会把区间内的记录标成 ``FLUSHED_DONE`` 并删掉批次记录
-        ——对账的目的就是让这里不再需要被查到。``failed`` 只更新批次记录，
+        ``completed`` 会把归属该批次的记录标成 ``FLUSHED_DONE`` 并删掉批次
+        记录——对账的目的就是让这里不再需要被查到。``failed`` 只更新批次记录，
         记录仍停在 ``FLUSHED_ENQUEUED``，等 retry 或最终回退时再动。
 
         Args:
@@ -371,20 +379,32 @@ class SqlModelManager:
                 return 0
 
             if status == "completed":
-                # 先记下 id 区间，删记录之后再也读不到。
-                first_id, last_id = record.first_row_id, record.last_row_id
+                # 认领时记下了多少行，必须在删记录前读出来：commit 之后这个
+                # 对象已经过期，再取字段会抛 ObjectDeletedError。
+                expected = record.items_count
                 session.delete(record)
+                # 按归属回写，不按 id 区间：区间是闭集，认领带洞时会盖住
+                # 别的批次仍处于「已入队」的行，把它们的记忆无凭无据地
+                # 标成已完成，绕过 retry/release。
                 result = session.execute(
                     update(RawMessage)
                     .where(
-                        RawMessage.id >= first_id,
-                        RawMessage.id <= last_id,
+                        RawMessage.operation_id == operation_id,
                         RawMessage.flushed == FLUSHED_ENQUEUED,
                     )
-                    .values(flushed=FLUSHED_DONE)
+                    # 归属在完成时清空：这行已经落地，不再属于任何在途批次。
+                    .values(flushed=FLUSHED_DONE, operation_id="")
                 )
                 session.commit()
-                return result.rowcount or 0
+                resolved = result.rowcount or 0
+                if self._log is not None and expected and resolved != expected:
+                    # 行数少了说明本批有行已不在「已入队」（被别的路径动过，
+                    # 或迁移时被退回）。不自动补，只留痕便于排查。
+                    self._log.warning(
+                        f"批次 {operation_id} 回写了 {resolved} 行，"
+                        f"与认领时的 {expected} 行不一致"
+                    )
+                return resolved
 
             record.status = status
             record.error = error
@@ -415,16 +435,15 @@ class SqlModelManager:
             record = session.exec(statement).first()
             if record is None:
                 return 0
-            first_id, last_id = record.first_row_id, record.last_row_id
             session.delete(record)
+            # 与 resolve_operation 对称：按归属回写，并清空归属。
             result = session.execute(
                 update(RawMessage)
                 .where(
-                    RawMessage.id >= first_id,
-                    RawMessage.id <= last_id,
+                    RawMessage.operation_id == operation_id,
                     RawMessage.flushed == FLUSHED_ENQUEUED,
                 )
-                .values(flushed=FLUSHED_PENDING)
+                .values(flushed=FLUSHED_PENDING, operation_id="")
             )
             session.commit()
             released = result.rowcount or 0

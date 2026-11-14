@@ -32,6 +32,15 @@ class RawMessage(PBaseModel, table=True):
     content_hash: str = Field(default="", index=True, unique=True)
     # 三态，取值见本模块顶部的 FLUSHED_* 常量。
     flushed: int = Field(default=FLUSHED_PENDING, index=True)
+    # 这一行归属哪个提交批次（空串 = 不在任何批次里，即还没提交过）。
+    #
+    # 归属必须落在行上，不能靠 id 区间反推：一次认领拿到的 id 可能带洞
+    # （低 id 的行被上一个失败批次退回过、中间又有新行插进来），
+    # min/max 组成的闭区间会盖住别的批次仍处于「已入队」的行——对账完成时
+    # 把别人的行一起标成完成，等于绕过 retry/release，静默丢记忆。
+    #
+    # 有了这一列，对账和撤回都是 WHERE operation_id = ?，判据就是归属本身。
+    operation_id: str = Field(default="", index=True)
 
 
 # 一次 retain 请求的凭据。
@@ -40,10 +49,10 @@ class RawMessage(PBaseModel, table=True):
 # 没有这张表，进程一重启就彻底失忆：那些已入队但失败的批会永远停在
 # FLUSHED_ENQUEUED，既不会被重投，也不会被重试。
 #
-# 为什么用 id 区间而不是逐行外键：一批待投递的记录是 id 连续的区间，一次提交
-# 正好覆盖一个区间，存 (first_row_id, last_row_id) 就能反查回 rawmessage，
-# 不必给每行加一列外键。代价是「区间内后来补插的行」归属有歧义，但 rawmessage
-# 只追加、id 严格递增、分批按 id 升序切，实际不会出问题。
+# 归属关系存在 RawMessage.operation_id 上，这张表只记「还没结论的批次」本身。
+# 曾经用 (first_row_id, last_row_id) 闭区间来表示归属，v1 迁移时已废弃：
+# 区间不是集合，认领带洞时会串到别的批次。这两列保留下来只作遥测（日志与
+# 排错时看得到这批大致覆盖哪个 id 范围），不参与任何状态回写。
 class SyncOperation(PBaseModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
 
@@ -56,9 +65,12 @@ class SyncOperation(PBaseModel, table=True):
     # 所以巡检只看这个父 id 就够了。
     operation_id: str = Field(index=True, unique=True)
 
-    # 本批覆盖的 rawmessage.id 区间，闭区间。
+    # 本批覆盖的 rawmessage.id 大致范围（min/max 的认领结果），**仅作遥测**。
+    # 不要拿它们做状态回写：认领集合带洞时，区间会盖住别的批次的记录。
     first_row_id: int
     last_row_id: int
+    # 本批认领到的行数。对账完成时拿回写的 rowcount 与它比对，少说明有行
+    # 已不在「已入队」状态（被别的路径动过），值得留一条 warning。
     items_count: int = Field(default=0)
 
     # 对账用的本地状态：pending / completed / failed。

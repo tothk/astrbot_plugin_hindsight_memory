@@ -32,7 +32,7 @@ class BaseStore:
     def mark_flushed(self, ids, value: int = 2) -> int:
         return len(list(ids))
 
-    def mark_enqueued(self, ids, *, operation_id: str, items_count: int = 0) -> list:
+    def mark_enqueued(self, ids, *, operation_id: str) -> list:
         # 认领语义：返回真正拿到的行，调用方据此过滤原批次。
         return list(ids)
 
@@ -99,7 +99,7 @@ class TestStoreFailuresBecomeOutcome:
             def list_unflushed(self, limit: int = 1000):
                 return [make_raw(1)]
 
-            def mark_enqueued(self, ids, *, operation_id, items_count=0):
+            def mark_enqueued(self, ids, *, operation_id):
                 raise RuntimeError("disk full")
 
         calls = []
@@ -128,7 +128,7 @@ class TestStoreFailuresBecomeOutcome:
             def list_unflushed(self, limit: int = 1000):
                 return [make_raw(1)]
 
-            def mark_enqueued(self, ids, *, operation_id, items_count=0):
+            def mark_enqueued(self, ids, *, operation_id):
                 self.enqueued.append((list(ids), operation_id))
                 # 认领语义：返回真正拿到的主键列表，不是行数。
                 return list(ids)
@@ -166,7 +166,7 @@ class TestStoreFailuresBecomeOutcome:
             def list_unflushed(self, limit: int = 1000):
                 return [make_raw(1)]
 
-            def mark_enqueued(self, ids, *, operation_id, items_count=0):
+            def mark_enqueued(self, ids, *, operation_id):
                 self.enqueued.append(operation_id)
                 return list(ids)
 

@@ -1,7 +1,7 @@
 """SqlModelManager 里投递相关的读写方法。
 
 用真实 sqlite（临时目录里的库），不 mock 数据库行为——这些方法的语义
-（按 id 升序、只取待投递、三态转换、批次区间回写）正是要靠真实 SQL 才能验证的。
+（按 id 升序、只取待投递、三态转换、按归属回写）正是要靠真实 SQL 才能验证的。
 """
 
 from sqlmodel import Session, select
@@ -116,7 +116,7 @@ class TestEnqueueAndResolve:
         first = sql.insert_raw(make_raw(text="一"))
         second = sql.insert_raw(make_raw(text="二"))
         claimed = sql.mark_enqueued(
-            [first.id, second.id], operation_id="op-1", items_count=1
+            [first.id, second.id], operation_id="op-1"
         )
         # 返回值是「认领到的主键」而不是行数：调用方要据此过滤原批次，
         # 只把真正属于这一次的行交给服务端。
@@ -190,6 +190,76 @@ class TestEnqueueAndResolve:
         assert gap.id is not None
         pending = sql.list_unflushed()
         assert [row.raw_message for row in pending] == ["夹在中间的新行"]
+
+    def test_resolve_completed_does_not_touch_other_ops_enqueued_rows(
+        self, sql
+    ) -> None:
+        """认领带洞时，闭区间会盖住别的批次仍在途的行。
+
+        这是「区间式回写」最致命的一种：op-y 的行被 op-z 的完成顺手标成
+        DONE，服务端若最终判定 op-y 失败，那几条记忆就永久丢了——绕过了
+        retry，也没人再会去重投。
+        """
+        # op-x 认领 [1,2,3] 后失败被退回，1,2,3 回到待投递
+        rows = [sql.insert_raw(make_raw(text=f"第{i}句")) for i in range(3)]
+        x_ids = [row.id for row in rows]
+        assert sql.mark_enqueued(x_ids, operation_id="op-x") == x_ids
+        sql.resolve_operation("op-x", status="failed", error="boom", attempts=3)
+        assert sql.release_operation("op-x") == 3
+
+        # op-y 认领 [4,5,6]，仍在服务端处理中
+        y_rows = [sql.insert_raw(make_raw(text=f"y{i}句")) for i in range(3)]
+        y_ids = [row.id for row in y_rows]
+        assert sql.mark_enqueued(y_ids, operation_id="op-y") == y_ids
+
+        # 新消息 7,8,9 到来，和重回待投递的 1,2,3 一起被 op-z 认领。
+        # 它的 id 集合是 {1,2,3,7,8,9}，min/max 区间恰好是 [1,9]，把 op-y 的
+        # 4,5,6 裹在中间。
+        z_rows = [sql.insert_raw(make_raw(text=f"z{i}句")) for i in range(3)]
+        z_ids = [row.id for row in z_rows]
+        claimed = sql.mark_enqueued(x_ids + z_ids, operation_id="op-z")
+        assert claimed == x_ids + z_ids
+        z_op = [op for op in sql.pending_operations() if op.operation_id == "op-z"][0]
+        assert z_op.first_row_id == x_ids[0]
+        assert z_op.last_row_id == z_ids[-1]
+
+        # op-z 完成：只能动它自己认领的 6 行
+        assert sql.resolve_operation("op-z", status="completed") == 6
+
+        # op-y 的三行必须仍是「已入队」，它的凭据也还在，等着下一轮对账
+        with Session(sql._engine) as session:
+            for row_id in y_ids:
+                row = session.get(RawMessage, row_id)
+                assert row is not None
+                assert row.flushed == FLUSHED_ENQUEUED, f"{row_id} 被别的批次改写了"
+                assert row.operation_id == "op-y", f"{row_id} 的归属被改写"
+        assert [op.operation_id for op in sql.pending_operations()] == ["op-y"]
+
+    def test_release_does_not_touch_other_ops_enqueued_rows(self, sql) -> None:
+        """撤回的对称面：区间同样会盖住别人的行，退回待投递就是重复投递。"""
+        rows = [sql.insert_raw(make_raw(text=f"第{i}句")) for i in range(3)]
+        x_ids = [row.id for row in rows]
+        sql.mark_enqueued(x_ids, operation_id="op-x")
+        sql.resolve_operation("op-x", status="failed", error="boom", attempts=3)
+        sql.release_operation("op-x")
+
+        y_rows = [sql.insert_raw(make_raw(text=f"y{i}句")) for i in range(3)]
+        y_ids = [row.id for row in y_rows]
+        sql.mark_enqueued(y_ids, operation_id="op-y")
+
+        z_rows = [sql.insert_raw(make_raw(text=f"z{i}句")) for i in range(3)]
+        z_ids = [row.id for row in z_rows]
+        sql.mark_enqueued(x_ids + z_ids, operation_id="op-z")
+
+        # 撤回 op-z：只能退回它自己的 6 行，op-y 的 3 行必须原样留在「已入队」
+        assert sql.release_operation("op-z") == 6
+        with Session(sql._engine) as session:
+            for row_id in y_ids:
+                row = session.get(RawMessage, row_id)
+                assert row is not None
+                assert row.flushed == FLUSHED_ENQUEUED, f"{row_id} 被误退回待投递"
+                assert row.operation_id == "op-y"
+        assert sql.count_by_flushed() == {FLUSHED_PENDING: 6, FLUSHED_ENQUEUED: 3}
 
     def test_resolve_failed_keeps_rows_enqueued(self, sql) -> None:
         row = sql.insert_raw(make_raw(text="一"))

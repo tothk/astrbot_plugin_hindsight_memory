@@ -238,7 +238,7 @@ class FakeStore:
         self.marked.extend(ids)
         return len(ids)
 
-    def mark_enqueued(self, ids, *, operation_id: str, items_count: int = 0) -> list[int]:
+    def mark_enqueued(self, ids, *, operation_id: str) -> list[int]:
         # 真实实现只认领仍待投递的行，返回认领到的主键；这里默认全部认领，
         # 需要模拟「被别的同步轮次抢先取走」的用例再用 taken 显式限定。
         id_list = [int(i) for i in ids if i not in self.taken]
@@ -356,11 +356,9 @@ class TestHindsightSyncRun:
         order: list[str] = []
 
         class OrderedStore(FakeStore):
-            def mark_enqueued(self, ids, *, operation_id, items_count=0):
+            def mark_enqueued(self, ids, *, operation_id):
                 order.append("enqueue")
-                return super().mark_enqueued(
-                    ids, operation_id=operation_id, items_count=items_count
-                )
+                return super().mark_enqueued(ids, operation_id=operation_id)
 
         class OrderedClient(FakeClient):
             async def retain(self, *args, **kwargs):

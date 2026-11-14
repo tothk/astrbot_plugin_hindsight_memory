@@ -133,6 +133,9 @@ LLM 没有跨会话的记忆。你把历史全塞进上下文，也是几轮之�
 | `message_sent_time` | 消息发生时刻，ISO 8601 带时区 |
 | `content_hash` | 去重指纹：`document_id + role + 正文` 的 SHA-256，唯一索引。不含时间与人格，也不含消息 ID |
 | `flushed` | `0` 待投递 / `1` 已入队 / `2` 已确认 |
+| `operation_id` | 这一行归属哪个提交批次。空串表示还没提交过。对账与撤回都按它定位，不按 id 区间 |
+
+> 带批次归属的这一版会在启动时自动做一次表结构迁移（`PRAGMA user_version` 从 1 到 2）：加 `operation_id` 列，并把升级瞬间还在途的批次**整体退回待投递**。它们会随下一轮同步重投一遍，代价是文档末尾可能多一段重复内容——重复可以接受，卡在「已入队」等不到结论才是真丢。
 
 `db/sqlite/` 下还有 `raw_message.db-wal` 和 `-shm`。SQLite 开了 WAL 模式，**备份时三个文件要一起拷**，或者先执行 `PRAGMA wal_checkpoint(TRUNCATE)`。
 

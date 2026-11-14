@@ -3,14 +3,13 @@
 每个版本一步，按 ``MIGRATIONS`` 的顺序往上爬，全部走完才允许插件继续启动。
 版本号存在 SQLite 的 ``PRAGMA user_version`` 里，不占表、不依赖任何表结构。
 
-当前没有待执行的迁移：v0.0.1 的表结构就是 v1，也是代码期望的版本。这套机制
-现在就做一件事——给已经存在的库打上 ``user_version = 1``，让「这个库是第几版
-结构」这个信息第一次真正存在。下次要加列、改类型、拆表时，写一个
-``v1_to_v2.py`` 并把 ``CURRENT_VERSION`` 改成 2 即可，老库会自动往上爬。
-
 为什么不用 Alembic：它面向多分支、可回滚、多人协作的场景，代价是一整套
 ``versions/`` 目录和配置文件，还会给插件添一个运行时依赖。这里两张表、
 单人开发、只往前升级，``user_version`` 加一个 dict 就是它的完整替代。
+
+版本历史：
+- v1：初始结构（rawmessage + syncoperation，批次归属用 id 区间表示）。
+- v2：批次归属落到 ``rawmessage.operation_id`` 上，见 :mod:`v1_to_v2`。
 """
 
 from typing import Callable
@@ -24,20 +23,29 @@ from .sql_utils import (
     set_user_version,
     table_exists,
 )
+from .v1_to_v2 import sql_v1_to_v2
 
 # 当前代码期望的结构版本。加新版本时改这里，并在 MIGRATIONS 里补一步。
-CURRENT_VERSION = 1
+CURRENT_VERSION = 2
 
 # key = 目标版本。值是「把库从 key-1 带到 key」的那一步。
-# 现在为空：v1 就是初始结构，没有需要转换的老版本。
-MIGRATIONS: dict[int, Callable[[Connection], None]] = {}
+MIGRATIONS: dict[int, Callable[[Connection], None]] = {
+    2: sql_v1_to_v2,
+}
+
+# 版本化之前建的库（user_version 一直是 0）统一认作这个版本。
+# 必须写死 1 而不是 CURRENT_VERSION：老库的真实形状只有 v1 一种，把它直接
+# 盖成最新版会让 v1→v2 这一步被跳过——列没加、索引没建，启动时才炸在
+# 「no such column: operation_id」，那时用户的数据已经在库里了。
+BASELINE_VERSION = 1
 
 
 def _detect_baseline(conn: Connection, log=None) -> int:
     """确定版本化之前创建的库停在哪个版本。
 
-    版本号是后加的，老库的 ``user_version`` 都是 0。v0.0.1 的表结构就是 v1，
-    所以「有 rawmessage 表」一律按 v1 处理，不需要再区分更细的形状。
+    版本号是后加的，老库的 ``user_version`` 都是 0。版本化引入时 v0.0.1 的
+    结构就是 v1，所以「有 rawmessage 表」一律按 v1 处理，之后由迁移链正常
+    往上爬。
 
     比 v1 还老的开发期库（没有 content_hash）直接抛异常让启动失败：那种库
     缺的不止一列，猜着补会把结构越补越乱，不如让人看见。宁可启动不起来，
@@ -58,7 +66,8 @@ def _detect_baseline(conn: Connection, log=None) -> int:
         return version
 
     if not table_exists(conn, "rawmessage"):
-        # 全新库：表由 create_all 按当前模型建，直接标到当前版本。
+        # 全新库：表由 create_all 按当前模型建（已经是最新形状），直接标到
+        # 当前版本，不必再走迁移链。
         set_user_version(conn, CURRENT_VERSION)
         return CURRENT_VERSION
 
@@ -70,9 +79,9 @@ def _detect_baseline(conn: Connection, log=None) -> int:
         )
 
     if log is not None:
-        log.warning(f"检测到版本化之前创建的数据库，标记为 v{CURRENT_VERSION}")
-    set_user_version(conn, CURRENT_VERSION)
-    return CURRENT_VERSION
+        log.warning(f"检测到版本化之前创建的数据库，标记为 v{BASELINE_VERSION}")
+    set_user_version(conn, BASELINE_VERSION)
+    return BASELINE_VERSION
 
 
 def run_migrations(engine: Engine, log=None) -> int:
