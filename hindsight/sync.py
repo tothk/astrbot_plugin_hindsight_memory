@@ -39,6 +39,17 @@ _LINE_SEPARATOR = "\n"
 # 用户的记录永远卡在「已入队」这个中间态里。
 MAX_ATTEMPTS = 3
 
+# 一轮投递最多从库里扫多少行。
+#
+# 它限制的不是「一次请求发多大」（那是 max_chars 的事），而是「一次持锁扫
+# 多少行」：``sync_once()`` 的锁会包住整个 run()，行数越多，锁被占用的时间
+# 越长；这段时间里手动 /hindsight_sync 会一直等着。
+#
+# 1000 行按每行 200 字估算约 200KB，按默认 5000 字一批切出来 40 批。异步提交
+# 下每批只打个招呼就返回，所以真出现积压也扛得住；只有在手动指令明显变迟钝时
+# 才需要调小它。
+_DEFAULT_PENDING_LIMIT = 1000
+
 
 def _sanitize_speaker(name: str) -> str:
     """把平台给的名字洗成可以安全拼进 ``Name (time): text`` 的形式。
@@ -388,7 +399,7 @@ class HindsightSync:
         self._user_name = user_name
         self._bot_name = bot_name
 
-    async def run(self, *, limit: int = 1000) -> SyncOutcome:
+    async def run(self, *, limit: int = _DEFAULT_PENDING_LIMIT) -> SyncOutcome:
         """执行一轮同步：先对账，再投递。
 
         Args:
@@ -599,11 +610,57 @@ class HindsightSync:
         )
         return 1
 
-    async def submit(self, *, limit: int = 1000) -> SyncOutcome:
-        """把还没入队的记录装配成批次，先在本地记下操作凭据，再提交。
+    async def submit(self, *, limit: int = _DEFAULT_PENDING_LIMIT) -> SyncOutcome:
+        """扫库取出待投递记录，逐批入队提交。
 
         Args:
-            limit: 本轮最多取多少条。
+            limit: 本轮最多从库里取多少条。注意它限制的是「一次持锁扫多少行」，
+                不是「一次请求发多大」——后者由 ``max_chars`` 决定。
+
+        Returns:
+            投递阶段的摘要，失败时 ``error`` 非空。
+        """
+        try:
+            pending = await asyncio.to_thread(self._store.list_unflushed, limit)
+        except Exception as exc:
+            # 读不到待投递记录就是这轮没东西可投，转成 error 交给上层显示。
+            self._log.error(f"读取待提交记录失败：{exc}")
+            return SyncOutcome(error=f"本地数据库异常：{exc}")
+        if not pending:
+            self._log.debug("没有待提交的对话记录")
+            return SyncOutcome()
+
+        return await self._submit_records(pending)
+
+    async def submit_records(self, records: Sequence[RawMessage]) -> SyncOutcome:
+        """只投递指定的这些记录，不查库。
+
+        给主动写入这类「我刚写了这几行，现在就把它送出去」的场景用：它不该
+        顺手把库里所有积压一起投，也不该触发对账。
+
+        Args:
+            records: 待投递的记录；空列表直接返回空摘要。
+
+        Returns:
+            投递阶段的摘要，字段含义与 ``submit()`` 相同。
+
+        Note:
+            调用方必须持有与 ``run()`` 相同的锁，否则后台的积压投递可能同时
+            把同一批行取走并标成已入队，两边各生成一个 ``operation_id``，
+            ``append`` 语义下不会去重，文档里就多出一份。
+        """
+        if not records:
+            return SyncOutcome()
+        return await self._submit_records(list(records))
+
+    async def _submit_records(self, pending: Sequence[RawMessage]) -> SyncOutcome:
+        """把给定记录装配成批次，先在本地记下操作凭据，再提交。
+
+        这是 ``submit()`` 与 ``submit_records()`` 的共同实体，只负责「给定一批
+        记录之后」的部分，不关心它们是怎么来的。
+
+        Args:
+            pending: 待投递的记录，非空；顺序即提交顺序。
 
         Returns:
             投递阶段的摘要：``messages`` / ``batches`` / ``documents`` /
@@ -619,16 +676,6 @@ class HindsightSync:
             会稳定地拿到 404——既然提交时用的就是本地记下的那个 id，404 就只能
             意味着服务端从没收到过，退回重投是安全的。
         """
-        try:
-            pending = await asyncio.to_thread(self._store.list_unflushed, limit)
-        except Exception as exc:
-            # 读不到待投递记录就是这轮没东西可投，转成 error 交给上层显示。
-            self._log.error(f"读取待提交记录失败：{exc}")
-            return SyncOutcome(error=f"本地数据库异常：{exc}")
-        if not pending:
-            self._log.debug("没有待提交的对话记录")
-            return SyncOutcome()
-
         batches = split_batches(pending, self._max_chars)
         documents = 0
         flushed = 0

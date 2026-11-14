@@ -591,6 +591,93 @@ class TestReconcile:
         assert order == ["get", "retain"]
 
 
+class TestSubmitRecords:
+    """只投递调用方指定的那几行（模型主动写入的场景）。"""
+
+    async def test_submits_given_records_without_touching_the_store(self, log) -> None:
+        # 库里还有别的积压，这批只该投指定的两行。
+        store = FakeStore([make_raw(id=99, text="别人的积压")])
+        client = FakeClient()
+        given = [make_raw(id=1, text="第一句"), make_raw(id=2, text="第二句")]
+
+        outcome = await HindsightSync(
+            store, client, bank_id="dev", max_chars=10_000, log=log
+        ).submit_records(given)
+
+        assert outcome.ok is True
+        assert outcome.flushed == 2
+        assert len(client.calls) == 1
+        content = client.calls[0][1][0]["content"]
+        assert "第一句" in content and "第二句" in content
+        assert "别人的积压" not in content
+        # 入队的是这两行自己的 id，不是 list_unflushed 拿到的 id 列表
+        ids, _ = store.enqueued[0]
+        assert ids == [1, 2]
+
+    async def test_empty_records_do_nothing(self, log) -> None:
+        store = FakeStore([make_raw(id=99)])
+        client = FakeClient()
+
+        outcome = await HindsightSync(
+            store, client, bank_id="dev", max_chars=10_000, log=log
+        ).submit_records([])
+
+        assert outcome.messages == 0
+        assert client.calls == []
+        assert store.enqueued == []
+
+    async def test_records_are_split_into_batches(self, log) -> None:
+        store = FakeStore([])
+        client = FakeClient()
+        given = [make_raw(id=i, text="这是一句比较长的对话内容") for i in range(1, 6)]
+
+        outcome = await HindsightSync(
+            store, client, bank_id="dev", max_chars=60, log=log
+        ).submit_records(given)
+
+        assert outcome.ok is True
+        assert len(client.calls) == len(store.enqueued) > 1
+        assert outcome.flushed == 5
+
+    async def test_does_not_reconcile(self, log) -> None:
+        # 主动写入只对自己那几行负责，不该顺手把全库的批次对一遍账。
+        store = FakeStore([])
+        store.operations = [make_operation("op-old")]
+        client = FakeClient(statuses={"op-old": {"status": "completed"}})
+
+        await HindsightSync(
+            store, client, bank_id="dev", max_chars=10_000, log=log
+        ).submit_records([make_raw(id=1)])
+
+        assert store.resolved == []
+        assert store.released == []
+
+    async def test_enqueues_before_sending(self, log) -> None:
+        order: list[str] = []
+        store = FakeStore([])
+        client = FakeClient()
+
+        original_enqueue = store.mark_enqueued
+        original_retain = client.retain
+
+        def tracked_enqueue(*args, **kwargs):
+            order.append("enqueue")
+            return original_enqueue(*args, **kwargs)
+
+        async def tracked_retain(bank_id, items, **kwargs):
+            order.append("retain")
+            return await original_retain(bank_id, items, **kwargs)
+
+        store.mark_enqueued = tracked_enqueue  # type: ignore[method-assign]
+        client.retain = tracked_retain  # type: ignore[method-assign]
+
+        await HindsightSync(
+            store, client, bank_id="dev", max_chars=10_000, log=log
+        ).submit_records([make_raw(id=1)])
+
+        assert order == ["enqueue", "retain"]
+
+
 async def _raise_operation_missing(bank_id: str, operation_id: str) -> dict:
     raise HindsightOperationNotFoundError("操作不存在")
 
