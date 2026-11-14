@@ -147,7 +147,7 @@ LLM 没有跨会话的记忆。你把历史全塞进上下文，也是几轮之�
 | --- | --- |
 | 日志完全没有「已记录」 | 是不是群聊？插件只记私聊 |
 | 「⚠️ 本条对话记录保存失败」 | `raw_message.db` 被占用或磁盘满；看日志里的具体异常 |
-| `/hindsight_sync` 报「请求超时」 | 服务端在处理，但耗时超过 `RETAIN_TIMEOUT`；异步提交正常不会卡这么久，检查网络 |
+| `/hindsight_sync` 报「请求超时」 | 服务端没能在 30 秒内接下这批（`DEFAULT_TIMEOUT`）。提交是异步的，正常只花几百毫秒；一直超时说明服务过载或网络不通，先 `curl <host>:<port>/health` |
 | `/hindsight_sync` 报「HTTP 404」 | `hindsight_bank_id` 填错，或服务端从没建过这个库（插件会自动建） |
 | 「本轮没有命中记忆」一直出现 | 记录还没投递成功，或 bank 是空的；先跑一次 `/hindsight_sync` |
 | 召回到的记忆是英文的 | 服务端抽取模型的倾向问题，与插件无关，详见 [docs/hindsight-api.md](docs/hindsight-api.md) |
@@ -155,12 +155,20 @@ LLM 没有跨会话的记忆。你把历史全塞进上下文，也是几轮之�
 
 ## 开发与测试
 
+测试**必须在 AstrBot 的源码环境里跑**，不能拿一个干净虚拟环境从零开始：
+
+- 插件要放在 `<AstrBot 源码根>/data/plugins/` 下——`test/conftest.py` 按 `PLUGIN_DIR.parents[2]` 反推宿主源码根，靠它把 `astrbot` 加进 `sys.path`；放别处会直接 `ModuleNotFoundError: No module named 'astrbot'`。
+- 解释器要用激活了宿主依赖的那个 venv（`sqlalchemy`、`sqlmodel`、`httpx` 都随 AstrBot 安装，项目自己的 `requirements.txt` 是空的）。`pytest` 与 `pytest-asyncio` 才是额外依赖，见 `requirements-dev.txt`。
+
 ```bash
-pip install -r requirements-dev.txt
-pytest
+# 在 <AstrBot 源码根> 下，先激活宿主 venv
+pip install -r data/plugins/astrbot_plugin_hindsight_memory/requirements-dev.txt
+python -m pytest data/plugins/astrbot_plugin_hindsight_memory -q
 ```
 
-测试不连接真实服务：`httpx.MockTransport` 拦截所有 HTTP，SQLite 用临时目录。跑通约需 7 秒。
+单靠 `pip install -r requirements-dev.txt && pytest` 在干净环境里跑不起来：缺 `astrbot` 本身，也缺 `sqlmodel`／`sqlalchemy`。
+
+测试不连接真实服务：`httpx.MockTransport` 拦截所有 HTTP，SQLite 用临时目录。跑通约需 10 秒。
 
 ```
 core/       记录与召回的编排（纯逻辑，不依赖 AstrBot 的运行时）

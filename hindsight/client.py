@@ -20,11 +20,9 @@ import httpx
 # 同一台机器上实测：一次同步 retain（3 行中文对话）从提交到抽取完成要 86 秒，
 # 远远超过 HTTP 客户端的合理等待时间；而召回必须在几秒内返回，慢了就会拖住
 # 用户这一轮对话。所以两组超时必须分开：
-#   - 写入走异步模式（async=True），HTTP 只负责排队，很快返回；
-#   - 同步写入只用于手工诊断，给一个宽松值；
+#   - 写入走异步模式（async=True），HTTP 只负责排队，很快返回，用默认值即可；
 #   - 召回用短超时，宁可这轮不带记忆，也不要让用户干等。
 DEFAULT_TIMEOUT = 30.0
-RETAIN_TIMEOUT = 120.0
 RECALL_TIMEOUT = 10.0
 
 
@@ -63,9 +61,9 @@ class HindsightRequestError(HindsightError):
 class HindsightBankNotFoundError(HindsightRequestError):
     """目标记忆库不存在（HTTP 404）。
 
-    单独成一类是因为它可恢复：服务端不会因为你 retain 就凭空建库，而召回
-    一个还没写过东西的库会稳定返回 404。调用方可以 ``ensure_bank()`` 建库
-    再重试，其它 4xx 则没有这种补救。
+    单独成一类是因为它可恢复：召回不存在的库返回 404；retain 到不存在的库
+    会顺带建库。建库兜底是为召回路径准备的，调用方可以 ``ensure_bank()``
+    建库再重试，其它 4xx 则没有这种补救。
 
     Note:
         客户端里所有业务路径都挂在 bank 下，因此这里把 404 一律当作
@@ -392,8 +390,9 @@ class HindsightClient:
     async def ensure_bank(self, bank_id: str) -> bool:
         """确保记忆库存在，不存在则以默认配置创建。
 
-        服务端不会因为一次 retain/recall 就自动建库：召回一个空库会稳定
-        返回 404 ``Bank 'xxx' not found``。首次运行的插件因此永远召回失败。
+        召回不存在的库返回 404；retain 到不存在的库会顺带建库。建库兜底是
+        为召回路径准备的：召回一个空库会稳定返回 404 ``Bank 'xxx' not
+        found``，首次运行的插件因此永远召回失败。
 
         用 ``PUT /v1/default/banks/{bank_id}`` 建库（同一个操作也用于更新，
         重复调用返回 200，天然幂等）。空 body 表示全部取服务端默认值，

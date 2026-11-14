@@ -23,7 +23,7 @@ _DEFAULT_DAILY_TIME = "00:05"
 
 # 上限只做保护：面板里滑块已经限死范围，但仍可能被手工改 JSON 绕过。
 _MAX_BATCH_CHARS = 50000
-_MAX_RECALL_QUANTITY = 50
+_MAX_RECALL_QUANTITY = 30
 
 
 def _as_int(value, default: int, *, minimum: int, maximum: int) -> int:

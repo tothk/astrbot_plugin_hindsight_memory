@@ -454,10 +454,10 @@ await client.retain(bank_id, items, is_async=True, operation_id=operation_id)
 
 ```python
 try:
-    return await client.recall(bank_id, query, max_tokens=1024)
+    return await client.recall(bank_id, query)
 except HindsightBankNotFoundError:          # 404 单独成一个异常类型
     await client.ensure_bank(bank_id)        # PUT /v1/default/banks/{bank_id}，body 传 {}
-    return await client.recall(bank_id, query, max_tokens=1024)   # 只重试一次
+    return await client.recall(bank_id, query)   # 只重试一次
 ```
 
 三个容易写错的点：
