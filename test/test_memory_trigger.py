@@ -30,9 +30,14 @@ class FakeSync:
             messages=2, batches=1, documents=1, flushed=2
         )
         self.calls = 0
+        self.records_calls: list[list] = []
 
     async def run(self) -> SyncOutcome:
         self.calls += 1
+        return self.outcome
+
+    async def submit_records(self, records) -> SyncOutcome:
+        self.records_calls.append(list(records))
         return self.outcome
 
 
@@ -238,3 +243,72 @@ class TestSyncMutualExclusion:
         retry = await service.sync_once(trigger="手动指令")
         assert retry.ok is True
         assert retry.flushed == 2
+
+
+class TestSyncRecords:
+    """按指定记录投递：与 sync_once 共用同一把锁，但不跑对账、不扫全库。"""
+
+    async def test_submits_the_given_records(self, log):
+        service, sync = make_service(log)
+        rows = [object(), object()]
+
+        outcome = await service.sync_records(rows, trigger="主动写入")
+
+        assert outcome.ok is True
+        assert sync.records_calls == [rows]
+        # 关键：没有走 sync_once 那条「扫全库 + 对账」的路。
+        assert sync.calls == 0
+
+    async def test_empty_records_skip_the_lock_and_the_client(self, log):
+        service, sync = make_service(log)
+
+        outcome = await service.sync_records([])
+
+        assert outcome.ok is True
+        assert outcome.flushed == 0
+        assert sync.records_calls == []
+
+    async def test_exception_becomes_an_error_outcome(self, log):
+        # 投递异常不能冒到工具函数里——那会让模型看到堆栈，
+        # 而我们真正想说的是「已记到本地，稍后重试」。
+        service, _sync = make_service(log)
+
+        class BoomSync:
+            async def submit_records(self, records):
+                raise RuntimeError("boom")
+
+        service._sync = BoomSync()
+        outcome = await service.sync_records([object()])
+
+        assert outcome.ok is False
+        assert "boom" in (outcome.error or "")
+        assert any("boom" in msg for msg in log.text_of("error"))
+
+    async def test_waits_for_a_running_sync_once(self, log):
+        # 主动写入与后台投递／手动指令共用同一把锁：
+        # 两边同时读到同一批待投递记录会导致重复追加。
+        service, sync = make_service(log)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockingSync:
+            async def run(self):
+                entered.set()
+                await release.wait()
+                return SyncOutcome(messages=1, batches=1, documents=1, flushed=1)
+
+            async def submit_records(self, records):
+                return SyncOutcome(messages=1, batches=1, documents=1, flushed=1)
+
+        service._sync = BlockingSync()
+        background = asyncio.create_task(service.sync_once(trigger="每日补投"))
+        await entered.wait()
+
+        active = asyncio.create_task(service.sync_records([object()]))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not active.done(), "上一轮还在跑，这一轮必须等锁"
+
+        release.set()
+        await background
+        await active

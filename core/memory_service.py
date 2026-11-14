@@ -5,14 +5,17 @@
 - ``MessageCapture`` 只管把消息变成库里的行（同步侧）。
 - ``HindsightSync`` 只管把行投递给远端。
 - 本模块负责把它们和配置、定时任务、HTTP 客户端生命周期接起来，
-  并对外提供两个动作：``recall_for(text)`` 与 ``sync_once()``。
+  并对外提供三个动作：``recall_for(text)``、``sync_once()`` 与
+  ``sync_records()``（只投指定的几行，不做对账）。
 
 本模块 import astrbot 仅用于类型注解，实际依赖全部由 main.py 注入。
 """
 
 import asyncio
 from datetime import datetime, time, timedelta
+from typing import Sequence
 
+from ..db.models.models import RawMessage
 from ..hindsight.client import HindsightClient
 from ..hindsight.plugin_config import HindsightConfig
 from ..hindsight.sync import HindsightSync, SyncOutcome
@@ -293,6 +296,45 @@ class MemoryService:
             f"{trigger}同步完成：{outcome.flushed}/{outcome.messages} 条，"
             f"{outcome.batches} 批，{outcome.documents} 个文档"
         )
+        return outcome
+
+    async def sync_records(
+        self, records: Sequence[RawMessage], *, trigger: str = "主动写入"
+    ) -> SyncOutcome:
+        """只投递指定的这些记录，不扫库、不对账。
+
+        给主动写入用：模型说「我刚记下这几句」，就应该只送这几句，而不是
+        顺手把库里所有积压一起投出去、更不该替别人的旧批次回查状态。
+
+        Args:
+            records: 待投递的记录，通常是刚刚写入的那几行。
+            trigger: 触发来源，仅用于日志。
+
+        Returns:
+            投递阶段的结果摘要；失败时 ``error`` 非空而不抛异常。
+
+        Note:
+            必须持有与 ``sync_once()`` 同一把锁。否则后台的积压投递可能恰好
+            把同样这几行取走并标成「已入队」，两边各生成一个 ``operation_id``，
+            ``append`` 语义下服务端不会去重，文档里就多出一份。
+        """
+        if not records:
+            return SyncOutcome()
+        async with self._sync_lock:
+            try:
+                outcome = await self._sync.submit_records(records)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._log.error(f"{trigger}投递异常: {e}")
+                return SyncOutcome(error=str(e))
+        if not outcome.ok:
+            self._log.warning(f"{trigger}投递中断：{outcome.error}")
+        elif outcome.flushed:
+            self._log.info(
+                f"{trigger}投递完成：{outcome.flushed}/{outcome.messages} 条，"
+                f"{outcome.batches} 批，{outcome.documents} 个文档"
+            )
         return outcome
 
     async def recall_for(self, text: str) -> str:
