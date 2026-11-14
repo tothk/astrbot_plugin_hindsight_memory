@@ -13,6 +13,7 @@ from astrbot_plugin_hindsight_memory.db.models.models import RawMessage
 from astrbot_plugin_hindsight_memory.hindsight.client import (
     HindsightConnectionError,
     HindsightOperationNotFoundError,
+    HindsightServerError,
     RetainResult,
 )
 from astrbot_plugin_hindsight_memory.hindsight.sync import (
@@ -310,7 +311,7 @@ class FakeClient:
             operation_id=self.operation_id,
         )
 
-    async def get_operation(self, bank_id: str, operation_id: str) -> dict:
+    async def get_operation(self, bank_id: str, operation_id: str, *, timeout=None) -> dict:
         return self.statuses.get(operation_id, {"status": "pending"})
 
     async def retry_operation(self, bank_id: str, operation_id: str) -> dict:
@@ -548,14 +549,16 @@ class TestReconcile:
         assert outcome.released == 0
 
     async def test_query_error_skips_that_batch(self, log) -> None:
-        """单个批次查不到不影响别的批次。"""
+        """单个批次查询出错（非网络故障）不影响别的批次。"""
         store = FakeStore([])
         store.operations = [make_operation("op-1"), make_operation("op-2")]
         client = FakeClient(statuses={"op-2": {"status": "completed"}})
 
-        async def flaky(bank_id: str, operation_id: str) -> dict:
+        async def flaky(bank_id: str, operation_id: str, *, timeout=None) -> dict:
             if operation_id == "op-1":
-                raise HindsightConnectionError("超时")
+                # 用 5xx 而不是连接失败：连接失败走的是「整轮中断」那条分支，
+                # 只有服务端单个请求出错才该跳过当前批次继续下一个。
+                raise HindsightServerError("服务端 503")
             return {"status": "completed"}
 
         client.get_operation = flaky  # type: ignore[method-assign]
@@ -564,6 +567,31 @@ class TestReconcile:
         ).run()
         assert store.resolved == [("op-2", "completed")]
         assert outcome.completed == 1
+
+    async def test_connection_error_stops_the_whole_round(self, log) -> None:
+        """连不上服务端时立刻结束对账，不再逐条等超时。"""
+        store = FakeStore([])
+        store.operations = [
+            make_operation("op-1"),
+            make_operation("op-2"),
+            make_operation("op-3"),
+        ]
+        client = FakeClient()
+        queried: list[str] = []
+
+        async def unreachable(bank_id: str, operation_id: str, *, timeout=None) -> dict:
+            queried.append(operation_id)
+            raise HindsightConnectionError("超时")
+
+        client.get_operation = unreachable  # type: ignore[method-assign]
+        outcome = await HindsightSync(
+            store, client, bank_id="dev", max_chars=10_000, log=log
+        ).run()
+
+        # 只试了第一条：后面两条注定同样超时，没有必要再等。
+        assert queried == ["op-1"]
+        assert store.released == []
+        assert outcome.completed == 0
 
     async def test_reconcile_runs_before_submit(self, log) -> None:
         """顺序不能反：先确认上一轮，再把新记录排进去。"""
@@ -574,7 +602,7 @@ class TestReconcile:
 
         original_get = client.get_operation
 
-        async def tracked_get(bank_id: str, operation_id: str) -> dict:
+        async def tracked_get(bank_id: str, operation_id: str, *, timeout=None) -> dict:
             order.append("get")
             return await original_get(bank_id, operation_id)
 
@@ -680,6 +708,8 @@ class TestSubmitRecords:
         assert order == ["enqueue", "retain"]
 
 
-async def _raise_operation_missing(bank_id: str, operation_id: str) -> dict:
+async def _raise_operation_missing(
+    bank_id: str, operation_id: str, *, timeout=None
+) -> dict:
     raise HindsightOperationNotFoundError("操作不存在")
 

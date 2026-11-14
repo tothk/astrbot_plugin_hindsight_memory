@@ -21,7 +21,12 @@ from dataclasses import dataclass
 from typing import Protocol, Sequence
 
 from ..db.models.models import RawMessage, SyncOperation
-from .client import HindsightClient, HindsightError, HindsightOperationNotFoundError
+from .client import (
+    HindsightClient,
+    HindsightConnectionError,
+    HindsightError,
+    HindsightOperationNotFoundError,
+)
 from .plugin_config import clean_nickname
 
 # 一条记录渲染成对话文本里的一行，行与行之间用换行拼接。
@@ -49,6 +54,14 @@ MAX_ATTEMPTS = 3
 # 下每批只打个招呼就返回，所以真出现积压也扛得住；只有在手动指令明显变迟钝时
 # 才需要调小它。
 _DEFAULT_PENDING_LIMIT = 1000
+
+# 对账时单次状态查询的超时秒数。
+#
+# 对账是一串短请求，不是一次长抽取：查状态只该花几百毫秒。但客户端的默认
+# 超时是 30 秒（那是留给 retain 的），恢复期服务不可达时，N 条凭据 × 30 秒
+# 会把一轮对账拖成几十分钟——期间 ``_sync_lock`` 一直被占着，手动
+# /hindsight_sync 会一直等下去。
+_RECONCILE_TIMEOUT = 10.0
 
 
 def _sanitize_speaker(name: str) -> str:
@@ -468,6 +481,14 @@ class HindsightSync:
         Note:
             单个批次查不到就跳过，不影响别的批次：服务端可能临时抽风，下一轮
             再查就是了。
+
+            但**连不上服务端时直接结束本轮**，不再逐条重试：网络不通、服务没
+            起这类原因对后面每一条同样成立，继续查只是把「超时秒数 × 待查条数」
+            叠起来。这一点和 ``submit()`` 里「一批失败就不再尝试后续批次」是
+            同一个判断，两处保持一致。
+
+            状态查询用短超时（``_RECONCILE_TIMEOUT``）而不是客户端默认的 30 秒：
+            对账会被周期任务频繁调用，一条卡住不该拖住整轮。
         """
         completed = retried = released = 0
 
@@ -481,7 +502,9 @@ class HindsightSync:
         for record in pending:
             operation_id = record.operation_id
             try:
-                data = await self._client.get_operation(self._bank_id, operation_id)
+                data = await self._client.get_operation(
+                    self._bank_id, operation_id, timeout=_RECONCILE_TIMEOUT
+                )
             except HindsightOperationNotFoundError:
                 # 查询用的 id 就是提交时用的那个，所以 404 只有两种可能：
                 #   1. 提交根本没到达服务端（发出前崩溃、网络断了）；
@@ -490,6 +513,13 @@ class HindsightSync:
                 # 批次每轮同步都会被查到，活不到被清理，所以概率极低。
                 released += self._release(operation_id, "服务端查无此操作")
                 continue
+            except HindsightConnectionError as exc:
+                # 连不上就别再查了：后面每一条都会以同样的方式超时。
+                # 已经处理完的批次保留成果，剩下的下一轮再来。
+                self._log.warning(
+                    f"对账中断，服务端不可达（{len(pending)} 条待查）：{exc}"
+                )
+                break
             except HindsightError as exc:
                 self._log.warning(f"查询操作状态失败（{operation_id}）：{exc}")
                 continue

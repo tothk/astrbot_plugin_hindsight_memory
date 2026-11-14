@@ -49,7 +49,7 @@ class BaseStore:
 
 
 class OkClient:
-    async def get_operation(self, bank_id: str, operation_id: str):
+    async def get_operation(self, bank_id: str, operation_id: str, *, timeout=None):
         return {"status": "completed"}
 
 
@@ -223,7 +223,7 @@ class TestStoreFailuresBecomeOutcome:
                 raise RuntimeError("database is locked")
 
         class MissingClient:
-            async def get_operation(self, bank_id, operation_id):
+            async def get_operation(self, bank_id, operation_id, *, timeout=None):
                 from astrbot_plugin_hindsight_memory.hindsight.client import (
                     HindsightOperationNotFoundError,
                 )

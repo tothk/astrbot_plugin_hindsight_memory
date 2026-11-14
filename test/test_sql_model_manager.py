@@ -405,7 +405,7 @@ class TestCrashRecovery:
                     is_async=is_async, usage={}, operation_id=operation_id,
                 )
 
-            async def get_operation(self, bank_id, operation_id):
+            async def get_operation(self, bank_id, operation_id, *, timeout=None):
                 if operation_id in self.submitted:
                     return {"status": "completed"}
                 raise HindsightOperationNotFoundError("查无此操作")

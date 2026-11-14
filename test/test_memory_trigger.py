@@ -33,10 +33,16 @@ class FakeSync:
         )
         self.calls = 0
         self.records_calls: list[list] = []
+        self.reconcile_calls = 0
+        self.reconcile_outcome = SyncOutcome()
 
     async def run(self) -> SyncOutcome:
         self.calls += 1
         return self.outcome
+
+    async def reconcile(self) -> SyncOutcome:
+        self.reconcile_calls += 1
+        return self.reconcile_outcome
 
     async def submit_records(self, records) -> SyncOutcome:
         self.records_calls.append(list(records))
@@ -406,3 +412,171 @@ class TestEnsureBankOnStart:
             release.set()
             memory_service._ENSURE_BANK_TIMEOUT = original
             await service.stop()
+
+
+class TestStartupCatchUp:
+    """启动时立刻补一轮同步，消除停机期间的状态漂移。"""
+
+    async def test_start_runs_one_sync_after_ensuring_bank(self, log):
+        # 顺序也要对：库还没确认存在就去投递，首批会白撞一轮。
+        order: list[str] = []
+        service, sync = make_service(log)
+        original_run = sync.run
+
+        async def tracked_run():
+            order.append("run")
+            return await original_run()
+
+        sync.run = tracked_run  # type: ignore[method-assign]
+
+        class Client(FakeBankClient):
+            async def ensure_bank(self, bank_id: str) -> bool:
+                order.append("ensure")
+                return await super().ensure_bank(bank_id)
+
+        service._client = Client(created=False)
+        await service.start()
+        try:
+            assert order == ["ensure", "run"]
+            assert sync.calls == 1
+            assert any("启动补投" in msg for msg in log.text_of("info"))
+        finally:
+            await service.stop()
+
+    async def test_reconcile_task_starts_with_the_service(self, log):
+        service, _sync = make_service(log)
+        service._client = FakeBankClient(created=False)
+
+        await service.start()
+        try:
+            assert service._reconcile_task is not None
+        finally:
+            await service.stop()
+        assert service._reconcile_task is None
+
+
+class TestReconcileOnce:
+    """只对账、不投递。"""
+
+    async def test_only_calls_reconcile(self, log):
+        service, sync = make_service(log)
+        sync.reconcile_outcome = SyncOutcome(completed=2)
+
+        outcome = await service.reconcile_once(trigger="测试")
+
+        assert sync.reconcile_calls == 1
+        assert sync.calls == 0, "对账不该顺手投递新内容"
+        assert outcome.completed == 2
+
+    async def test_nothing_to_check_stays_at_debug(self, log):
+        # 每 5 分钟跑一次，没在途批次时不能刷 info。
+        service, _sync = make_service(log)
+
+        await service.reconcile_once(trigger="周期对账")
+
+        assert any("没有需要确认的批次" in msg for msg in log.text_of("debug"))
+        assert not any("周期对账完成" in msg for msg in log.text_of("info"))
+
+    async def test_touched_batches_are_reported(self, log):
+        service, sync = make_service(log)
+        sync.reconcile_outcome = SyncOutcome(completed=1, retried=1, released=1)
+
+        await service.reconcile_once(trigger="周期对账")
+
+        assert any("确认落地 1 批" in msg for msg in log.text_of("info"))
+
+    async def test_exception_becomes_an_error_outcome(self, log):
+        service, sync = make_service(log)
+
+        class BoomSync:
+            async def reconcile(self):
+                raise RuntimeError("库锁住了")
+
+        service._sync = BoomSync()
+        outcome = await service.reconcile_once(trigger="测试")
+
+        assert outcome.ok is False
+        assert "库锁住了" in outcome.error
+
+    async def test_waits_for_a_running_sync_once(self, log):
+        """对账与投递必须串行：撤回会把行写回待投递，正在读快照的那轮会读到一半。"""
+        service, _sync = make_service(log)
+        snapshot_taken = asyncio.Event()
+        release = asyncio.Event()
+
+        class BlockingSync:
+            async def run(self):
+                snapshot_taken.set()
+                await release.wait()
+                return SyncOutcome()
+
+            async def reconcile(self):
+                return SyncOutcome(completed=1)
+
+        service._sync = BlockingSync()
+        background = asyncio.create_task(service.sync_once(trigger="积压触发"))
+        await snapshot_taken.wait()
+
+        active = asyncio.create_task(service.reconcile_once(trigger="周期对账"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not active.done(), "上一轮投递还没结束，对账必须等锁"
+
+        release.set()
+        await background
+        await active
+
+
+class TestReconcileLoop:
+    """周期对账任务本身。"""
+
+    async def test_loop_reconciles_repeatedly(self, log):
+        service, sync = make_service(log)
+        # 把间隔压到极短，避免测试真的等 5 分钟。
+        original = memory_service._RECONCILE_INTERVAL
+        memory_service._RECONCILE_INTERVAL = 0.01
+        try:
+            task = asyncio.create_task(service._reconcile_loop())
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if sync.reconcile_calls >= 2:
+                    break
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            assert sync.reconcile_calls >= 2
+        finally:
+            memory_service._RECONCILE_INTERVAL = original
+
+    async def test_loop_survives_a_failing_round(self, log):
+        # 这个任务没有人会重启，穿透一次就永久停摆。
+        service, _sync = make_service(log)
+        attempts = {"n": 0}
+
+        class FlakySync:
+            async def reconcile(self):
+                attempts["n"] += 1
+                if attempts["n"] == 1:
+                    raise RuntimeError("第一轮炸了")
+                return SyncOutcome(completed=1)
+
+        service._sync = FlakySync()
+        original = memory_service._RECONCILE_INTERVAL
+        memory_service._RECONCILE_INTERVAL = 0.01
+        try:
+            task = asyncio.create_task(service._reconcile_loop())
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if attempts["n"] >= 2:
+                    break
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            assert attempts["n"] >= 2, "第一轮异常后循环必须继续"
+            assert any("周期对账异常" in msg for msg in log.text_of("error"))
+        finally:
+            memory_service._RECONCILE_INTERVAL = original

@@ -457,12 +457,17 @@ class HindsightClient:
             f"/v1/default/banks/{_quote_bank(bank_id)}/operations", params=params
         )
 
-    async def get_operation(self, bank_id: str, operation_id: str) -> dict:
+    async def get_operation(
+        self, bank_id: str, operation_id: str, *, timeout: float | None = None
+    ) -> dict:
         """查询单个操作的当前状态。
 
         Args:
             bank_id: 记忆库标识。
             operation_id: 操作标识（``retain`` 响应里返回的那个）。
+            timeout: 单次请求的超时秒数。省略则用全局默认值。对账会连着查
+                很多条，恢复期服务不可达时每条都等满默认超时会把一轮同步
+                拖成几十分钟，所以调用方通常会传一个更短的值。
 
         Returns:
             服务端原始响应，关键字段是 ``status``（``pending`` /
@@ -473,7 +478,8 @@ class HindsightClient:
         if not wanted:
             raise ValueError("operation_id 不能为空")
         return await self._get(
-            f"/v1/default/banks/{_quote_bank(bank_id)}/operations/{quote(wanted, safe='')}"
+            f"/v1/default/banks/{_quote_bank(bank_id)}/operations/{quote(wanted, safe='')}",
+            timeout=timeout,
         )
 
     async def retry_operation(self, bank_id: str, operation_id: str) -> dict:

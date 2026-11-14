@@ -5,8 +5,8 @@
 - ``MessageCapture`` 只管把消息变成库里的行（同步侧）。
 - ``HindsightSync`` 只管把行投递给远端。
 - 本模块负责把它们和配置、定时任务、HTTP 客户端生命周期接起来，
-  并对外提供三个动作：``recall_for(text)``、``sync_once()`` 与
-  ``sync_records()``（只投指定的几行，不做对账）。
+  并对外提供四个动作：``recall_for(text)``、``sync_once()``、
+  ``sync_records()``（只投指定的几行）与 ``reconcile_once()``（只对账）。
 
 本模块 import astrbot 仅用于类型注解，实际依赖全部由 main.py 注入。
 """
@@ -31,6 +31,18 @@ _ENSURE_BANK_TIMEOUT = 5.0
 # 定时任务的兜底间隔：如果算出的等待时间不合理（时钟回拨、配置写错），
 # 也不要让任务睡上几天或负值空转。
 _MIN_SLEEP = 60.0
+
+# 周期对账的间隔秒数。
+#
+# 对账和投递是两件正交的事，触发条件不该共用：投递看「攒够多少字」，而对账
+# 要看「上一批到底有没有落地」。只靠每日 00:05 的话，服务端早就 completed 的
+# 批次会在本地一直卡在「已入队」——用户半夜发完消息、第二天看到 AI 记不住，
+# 而库里明明有记录。
+#
+# 5 分钟是权衡：一轮对账在没有积压时只是一次 SELECT，很便宜；有积压时每条要
+# 一次 HTTP 往返，频率再高就不划算。不做成配置项——用户分不清「对账间隔」和
+# 「投递阈值」，而这个值对单实例插件足够安全。
+_RECONCILE_INTERVAL = 300.0
 
 
 def parse_daily_time(raw: str) -> time:
@@ -124,6 +136,8 @@ class MemoryService:
         self._pending_chars = 0
         # 后台投递任务：同一时刻只允许一个，否则连发几条消息会并发抢同一批记录。
         self._sync_task: asyncio.Task | None = None
+        # 周期对账任务。与投递任务分开，见 _RECONCILE_INTERVAL 的说明。
+        self._reconcile_task: asyncio.Task | None = None
         # 三路触发（积压/每日/手动）共用的互斥锁。见 start() 的说明。
         #
         # 注意它必须守的临界区是「读出待投递记录 → 提交 → 标记已入队」，而不是
@@ -133,7 +147,7 @@ class MemoryService:
         self._sync_lock = asyncio.Lock()
 
     async def start(self) -> None:
-        """确认记忆库存在，然后启动每日补投任务。"""
+        """确认记忆库存在，补一轮同步，然后启动每日补投与周期对账。"""
         if self._task is not None:
             return
         # 先确认库存在再起任务：写入与召回共用同一个库，库不存在时召回会
@@ -141,7 +155,13 @@ class MemoryService:
         # 短暂不可达时这一轮不会建库，紧接着的首次投递就可能撞上库缺失。
         # 放在这里是一次性、幂等的，不占任何请求路径。
         await self._ensure_bank()
+        # 启动后立刻补一轮完整同步。停机期间服务端可能已经跑完了在途批次，
+        # 而本地还是「已入队」——这段漂移只有对账能消除。不在这里补的话，
+        # 最近一次结论要等到下一个 00:05（甚至更晚），中间用户会发现 AI
+        # 「记不住刚才说的话」。
+        await self.sync_once(trigger="启动补投")
         self._task = asyncio.create_task(self._daily_loop())
+        self._reconcile_task = asyncio.create_task(self._reconcile_loop())
         # 把两个称呼也打出来：它们会写进 Hindsight 的对话文本，配错了只有从
         # 抽取出的事实里才看得出来，启动日志是最省事的核对点。
         user_name = self._config.user_nickname or "（沿用记录值）"
@@ -183,31 +203,28 @@ class MemoryService:
     async def stop(self) -> None:
         """取消定时任务、后台投递任务并关闭连接池。
 
-        两个任务都已经自己兜住异常，正常不会带异常结束；这里仍再吞一次
+        这些任务都已经自己兜住异常，正常不会带异常结束；这里仍再吞一次
         ``Exception``：任务是 await 出来的，万一它因为别的意外死掉，
         ``await`` 会把那个异常重新抛进 ``terminate()``，而卸载阶段的报错
         既没人处理、也掩盖了真正的原因。
         """
-        if self._sync_task is not None:
-            self._sync_task.cancel()
+        for name, attr in (
+            ("后台投递任务", "_sync_task"),
+            ("周期对账任务", "_reconcile_task"),
+            ("每日补投任务", "_task"),
+        ):
+            task = getattr(self, attr)
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await self._sync_task
+                await task
             except asyncio.CancelledError:
                 # 主动取消不是异常，吞掉即可。
                 pass
             except Exception as e:
-                self._log.error(f"后台投递任务结束时异常: {e}")
-            self._sync_task = None
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                # 主动取消不是异常，吞掉即可。
-                pass
-            except Exception as e:
-                self._log.error(f"每日补投任务结束时异常: {e}")
-            self._task = None
+                self._log.error(f"{name}结束时异常: {e}")
+            setattr(self, attr, None)
         await self._client.aclose()
 
     def note_saved(self, text_length: int) -> None:
@@ -259,6 +276,25 @@ class MemoryService:
         except Exception as e:
             self._log.error(f"后台同步失败: {e}")
 
+    async def _reconcile_loop(self) -> None:
+        """每隔 ``_RECONCILE_INTERVAL`` 秒回查一次没结论的批次。
+
+        只对账、不投递：这两件事的触发条件本来就不同——投递看「攒够多少字」，
+        对账看「上一批到底落地没有」。混在一起的结果是，攒不够字的时候连对账
+        都不跑，服务端早就 completed 的批次会在本地一直卡着。
+
+        循环体必须自己兜住异常，理由与 ``_daily_loop`` 相同：这个任务没有人会
+        重启，穿透一次就永久停摆。
+        """
+        while True:
+            try:
+                await asyncio.sleep(_RECONCILE_INTERVAL)
+                await self.reconcile_once(trigger="周期对账")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._log.error(f"周期对账异常，本轮跳过，稍后重试: {e}")
+
     async def _daily_loop(self) -> None:
         """每天在配置的时刻补投一次未提交的记录。
 
@@ -281,6 +317,44 @@ class MemoryService:
                 # 配置本身时变成忙循环刷日志。
                 self._log.error(f"每日补投异常，本轮跳过，稍后重试: {e}")
                 await asyncio.sleep(_MIN_SLEEP)
+
+    async def reconcile_once(self, *, trigger: str = "对账") -> SyncOutcome:
+        """只回查在途批次的状态，不投递任何新内容。
+
+        与 ``sync_once()`` 拆开是必要的一步：投递的触发条件是「攒够了字数」，
+        对账的触发条件却是「过了多久」。合成一个入口时，写了几条短消息的用户
+        永远等不到一次对账，服务端已经 completed、本地还停在「已入队」。
+
+        Args:
+            trigger: 触发来源，仅用于日志。
+
+        Returns:
+            只含对账计数的摘要；失败时 ``error`` 非空而不抛异常。
+
+        Note:
+            与 ``sync_once()`` / ``sync_records()`` 共用同一把锁。``reconcile()``
+            里的撤回操作会把行写回待投递状态，此时若有别的轮次正在读
+            ``flushed=0`` 的快照，就会读到「放回了一半」的集合。锁之间不嵌套
+            （``reconcile()`` 自己不取锁），不会死锁。
+        """
+        async with self._sync_lock:
+            try:
+                outcome = await self._sync.reconcile()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self._log.error(f"{trigger}异常: {e}")
+                return SyncOutcome(error=str(e))
+        touched = outcome.completed or outcome.retried or outcome.released
+        if not touched:
+            # 没有在途批次时这里每 5 分钟就会跑一次，别刷 info 把日志淹了。
+            self._log.debug(f"{trigger}：没有需要确认的批次")
+            return outcome
+        self._log.info(
+            f"{trigger}完成：确认落地 {outcome.completed} 批，"
+            f"重新排队 {outcome.retried} 批，退回待投递 {outcome.released} 批"
+        )
+        return outcome
 
     async def sync_once(self, *, trigger: str = "手动") -> SyncOutcome:
         """执行一轮投递，失败只记日志不抛。
