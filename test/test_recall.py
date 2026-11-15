@@ -1,12 +1,17 @@
 """core/recall.py 的单元测试。
 
-重点在「库不存在时自动建库并重试一次」这条分支——它是首次安装唯一的
-自救路径，出错时表现是「悄悄没有记忆」，最难被发现。
+重点在「库不存在」这条分支——它是首次安装必走的路，出错时表现是
+「悄悄没有记忆」，最难被发现。现在的语义是：热路径只发一次请求，
+建库丢到后台，本轮按「没有记忆」处理。
 """
+
+import asyncio
 
 import pytest
 
 from astrbot_plugin_hindsight_memory.core.recall import (
+    _DEFAULT_TIMEOUT,
+    _REQUEST_TIMEOUT,
     _recall_or_create_bank,
     recall_memories,
 )
@@ -75,57 +80,43 @@ class TestRecallOrCreateBank:
         assert client.calls == [("recall", "b1", "q")]
         assert log.text_of("info") == []
 
-    async def test_creates_bank_then_retries_once(self):
+    async def test_missing_bank_spawns_background_creation(self):
+        # 库不存在时热路径只发一次请求就返回：库里没有东西，这一轮本来也
+        # 召不到记忆，不该为了让建库挤进 3 秒预算而多做几次往返。
         client = FakeClient(
-            responses=[
-                HindsightBankNotFoundError("Bank 'b1' not found"),
-                {"results": [{"text": "她喜欢猫"}]},
-            ]
+            responses=[HindsightBankNotFoundError("Bank 'b1' not found")]
         )
         log = Log()
 
         data = await _recall_or_create_bank(client, "b1", "q", log)
 
-        assert client.calls == [
-            ("recall", "b1", "q"),
-            ("ensure_bank", "b1"),
-            ("recall", "b1", "q"),
-        ]
-        assert data["results"][0]["text"] == "她喜欢猫"
+        assert data == {"results": []}
+        # 热路径上只有一次 recall，没有第二次。
+        assert client.calls == [("recall", "b1", "q")]
+
+        # 建库被丢到后台：让出一次事件循环，它就该跑完。
+        await asyncio.sleep(0)
+        assert client.calls == [("recall", "b1", "q"), ("ensure_bank", "b1")]
         assert any("不存在" in m for m in log.text_of("info"))
 
-    async def test_second_404_propagates_instead_of_looping(self):
-        # 建库后还 404 说明问题不在「库缺失」，继续重试就是死循环。
-        client = FakeClient(
-            responses=[
-                HindsightBankNotFoundError("not found"),
-                HindsightBankNotFoundError("still not found"),
-            ]
-        )
-
-        with pytest.raises(HindsightBankNotFoundError):
-            await _recall_or_create_bank(client, "b1", "q", Log())
-
-        assert sum(1 for c in client.calls if c[0] == "ensure_bank") == 1
-
     async def test_uses_low_budget(self):
-        # 服务端默认 mid 会稳定跑满 3 秒超时，这里钉死成 low。
+        # 服务端默认 mid 会稳定跑满超时，这里钉死成 low。
         client = FakeClient()
 
         await _recall_or_create_bank(client, "b1", "q", Log())
 
         assert client.keywords[0]["budget"] == "low"
 
-    async def test_retry_after_create_also_uses_low_budget(self):
-        # 两次 recall 都要带 budget：只改第一次的话，首次安装（必然走建库
-        # 分支）的那一轮仍是 mid。
-        client = FakeClient(
-            responses=[HindsightBankNotFoundError("not found"), {"results": []}]
-        )
+    async def test_request_timeout_is_below_outer_timeout(self):
+        # 内层 HTTP 超时必须小于外层 wait_for：否则外层先到期，正在飞的
+        # 请求被直接取消，日志里只剩一句「超时」，看不出是哪个请求慢。
+        client = FakeClient()
 
         await _recall_or_create_bank(client, "b1", "q", Log())
 
-        assert [kw["budget"] for kw in client.keywords] == ["low", "low"]
+        request_timeout = client.keywords[0]["timeout"]
+        assert request_timeout == pytest.approx(_REQUEST_TIMEOUT)
+        assert request_timeout < _DEFAULT_TIMEOUT
 
     async def test_filters_to_observation_at_server(self):
         # 类型过滤必须交给服务端：它参与检索与重排，客户端筛的话
@@ -136,25 +127,19 @@ class TestRecallOrCreateBank:
 
         assert client.keywords[0]["types"] == ["observation"]
 
-    async def test_retry_after_create_also_filters_types(self):
-        client = FakeClient(
-            responses=[HindsightBankNotFoundError("not found"), {"results": []}]
-        )
-
-        await _recall_or_create_bank(client, "b1", "q", Log())
-
-        assert [kw["types"] for kw in client.keywords] == [
-            ["observation"],
-            ["observation"],
-        ]
-
-    async def test_create_failure_propagates(self):
+    async def test_background_create_failure_does_not_escape(self):
+        # 后台任务没人 await，异常逃出去只会变成
+        # 「Task exception was never retrieved」噪声。
         client = FakeClient(
             responses=[HindsightBankNotFoundError("not found")], create_ok=False
         )
+        log = Log()
 
-        with pytest.raises(HindsightConnectionError):
-            await _recall_or_create_bank(client, "b1", "q", Log())
+        data = await _recall_or_create_bank(client, "b1", "q", log)
+
+        assert data == {"results": []}
+        await asyncio.sleep(0)  # 让后台任务执行并吞掉异常
+        assert any("后台建库失败" in m for m in log.text_of("warning"))
 
 
 class TestRecallMemories:
@@ -179,18 +164,14 @@ class TestRecallMemories:
         assert await recall_memories(client, "b1", "q", 0, Log()) == ""
         assert client.calls == []
 
-    async def test_bank_not_found_is_handled_internally(self):
-        # 库不存在不该冒到调用方：会先建库再重试，成功即正常返回。
-        client = FakeClient(
-            responses=[
-                HindsightBankNotFoundError("not found"),
-                {"results": [{"text": "她喜欢猫", "type": "world"}]},
-            ]
-        )
+    async def test_bank_not_found_returns_empty_without_raising(self):
+        # 库不存在不该冒到调用方，也不该在本轮重试：返回空结果，
+        # 建库由后台去做。
+        client = FakeClient(responses=[HindsightBankNotFoundError("not found")])
 
         text = await recall_memories(client, "b1", "q", 5, Log())
 
-        assert "她喜欢猫" in text
+        assert text == ""
 
     async def test_other_errors_return_empty_string(self):
         client = FakeClient(responses=[HindsightConnectionError("服务没起")])

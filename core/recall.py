@@ -2,12 +2,12 @@
 
 本模块不 import astrbot：HTTP 客户端与日志都由调用方注入，便于直接单测。
 
-召回策略：一次 recall 请求取回全部类型，再按「observation 优先」排序后截断。
-之所以不做两次请求（先只取 observation、不够再补），是因为每次 recall 都意味着
-一次向量检索 + 重排，成本远高于多拿回几条结果再在本地排。
+召回策略：只向服务端要 ``observation`` 类型（过滤在检索阶段生效，见
+``_RECALL_TYPES``），拿回来按原顺序截断即可，不做本地重排。
 
-记忆库不存在时会先创建再重试一次（见 ``_recall_or_create_bank``）：服务端不会
-因为一次召回就自动建库，而首次安装的插件库里必然是空的。
+记忆库不存在时**不在热路径建库**（见 ``_recall_or_create_bank``）：库里没有东西，
+这一轮本来也召不到记忆，没必要为了建库让用户多等几次往返。建库丢到后台做，
+下一轮自然就有库了。
 """
 
 import asyncio
@@ -33,6 +33,16 @@ _RECALL_TYPES = ["observation"]
 # 单次召回的硬超时。主回复的延迟不能被记忆检索拖住：宁可这轮没有记忆，
 # 也不能让用户等待。Hindsight 冷启动首次检索可能要几秒。
 _DEFAULT_TIMEOUT = 3.0
+
+# 单次 HTTP 请求的上限，必须**小于** ``_DEFAULT_TIMEOUT``。
+#
+# 外层 wait_for 一到期就把整段召回取消，而那时 httpx 请求还在飞——日志里只剩
+# 一句「超时」，看不出是哪个请求慢。把请求本身的超时压在下面，超时会由 HTTP
+# 层报出来（带 URL、带真实耗时）。留 0.5 秒给事件循环的调度余量。
+_REQUEST_TIMEOUT = 2.5
+
+# 后台建库的超时。它不占用户的时间，可以放宽，但也不能真的挂着不结束。
+_ENSURE_BANK_TIMEOUT = 5.0
 
 # 召回深度。服务端默认是 mid（候选池 300 条、图遍历也更深），实测在
 # 一对一的陪伴场景里会稳定跑满 3 秒超时，这一轮的记忆就白丢了。
@@ -122,16 +132,46 @@ def format_memories(results: list[dict], limit: int) -> str:
     return "\n".join([_HEADER, *lines])
 
 
+async def _ensure_bank_in_background(
+        client: HindsightClient, bank_id: str, log
+) -> None:
+    """在后台把记忆库建出来，失败只记日志。
+
+    没人 await 这个协程，所以异常必须自己吞掉：逃出去只会变成
+    ``Task exception was never retrieved`` 噪声，而且下次调用又是干净的。
+
+    Args:
+        client: Hindsight 客户端。
+        bank_id: 记忆库标识。
+        log: 日志对象。
+    """
+    try:
+        await asyncio.wait_for(
+            client.ensure_bank(bank_id), timeout=_ENSURE_BANK_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        log.warning(
+            f"后台建库超时（>{_ENSURE_BANK_TIMEOUT:g}s）：{bank_id!r}，下一轮召回时再试"
+        )
+    except HindsightError as e:
+        log.warning(f"后台建库失败：{bank_id!r}：{e}")
+    else:
+        log.info(f"记忆库 {bank_id!r} 不存在，已在后台按默认配置创建")
+
+
 async def _recall_or_create_bank(
         client: HindsightClient, bank_id: str, query: str, log
 ) -> dict:
-    """召回记忆；库不存在时先建库再重试一次。
+    """召回记忆；库不存在时把建库丢到后台，本轮按「没有记忆」处理。
 
-    服务端不会因为召回就自动建库，空库会稳定返回 404。首次安装的插件
-    因此永远拿不到记忆，日志里只有一行看不懂的 ``Bank 'default' not found``。
+    服务端不会因为召回就自动建库，空库会稳定返回 404。首次安装的插件因此
+    永远拿不到记忆——但**不能**在这里同步建库再重试：那条路径要走
+    recall(404) → GET 查存在性 → PUT 建库 → recall 重试四次往返，全挤在
+    ``recall_memories`` 那 3 秒里，首次安装那一轮必然超时，而且因为外层
+    wait_for 先到、超时只在 debug 里留一句，表现成「有记录但 AI 记不住」。
 
-    建库只做一次重试：如果建完还 404（PUT 被拒或权限不足），说明问题不在
-    「库缺失」上，再重试只会变成死循环。
+    建库交给后台任务的原因：库里没有东西时，这一轮本来也召不到记忆，
+    为用户省下这几次往返比让他等一个空结果更划算。下一轮召回时库已经在了。
 
     Args:
         client: Hindsight 客户端。
@@ -140,25 +180,30 @@ async def _recall_or_create_bank(
         log: 日志对象。
 
     Returns:
-        ``recall`` 的原始响应。
+        ``recall`` 的原始响应；库不存在时返回空结果。
 
     Raises:
-        HindsightBankNotFoundError: 建库后仍然找不到库。
-        HindsightError: 其它请求失败。
+        HindsightError: 其它请求失败（404 已在内部消化）。
     """
     try:
         return await client.recall(
-            bank_id, query, types=_RECALL_TYPES, budget=_RECALL_BUDGET
+            bank_id,
+            query,
+            types=_RECALL_TYPES,
+            budget=_RECALL_BUDGET,
+            timeout=_REQUEST_TIMEOUT,
         )
     except HindsightBankNotFoundError:
-        # 走到这里说明库确实不存在（404 是服务端明确告知的），
-        # 建库后立刻重试，用户这一轮就能拿到记忆，不必等下一轮。
-        # 重试也要带全参数：首次安装必然走这条分支，漏了就等于那一轮没用新策略。
-        await client.ensure_bank(bank_id)
-        log.info(f"记忆库 {bank_id!r} 不存在，已按默认配置创建")
-        return await client.recall(
-            bank_id, query, types=_RECALL_TYPES, budget=_RECALL_BUDGET
-        )
+        # 库里一条记忆都没有，本轮注定召不到东西。建库是后台的事。
+        try:
+            asyncio.get_running_loop().create_task(
+                _ensure_bank_in_background(client, bank_id, log)
+            )
+        except RuntimeError:
+            # 没有运行中的事件循环（同步上下文里被调用）：建库只能放弃，
+            # 但召回本身已经拿到了确定答案，不该因此报错。
+            log.debug(f"没有运行中的事件循环，跳过建库：{bank_id!r}")
+        return {"results": []}
 
 
 async def recall_memories(
@@ -180,7 +225,8 @@ async def recall_memories(
         query: 用户这一轮的原始消息。
         quantity: 最多注入几条。
         log: 日志对象，需提供 debug/warning。
-        timeout: 整体超时秒数。
+        timeout: 整体超时秒数。必须大于 :data:`_REQUEST_TIMEOUT`，否则
+            外层 wait_for 会先掐断正在飞的 HTTP 请求。
 
     Returns:
         可注入用户消息的文本；没有记忆或出错时返回空串。
