@@ -11,11 +11,11 @@ from astrbot.core.platform import MessageType
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 from .config.plugin_paths import PluginPaths
 from .db.models.sql_model_manager import SqlModelManager
-from .core.capture import MessageCapture
+from .core.capture import MessageCapture, bot_display_name
 from .core.memory_service import MemoryService, format_sync_result
 from .core.persona import persona_from_conversation
 from .core.recall import prune_previous_memories
-from .core.recorder import Recorder, build_raw_message
+from .core.recorder import Recorder, build_raw_message, resolve_bot_id
 from .hindsight.plugin_config import HindsightConfig
 
 
@@ -198,13 +198,14 @@ class HindsightMemory(Star):
     async def proactive_retain(
         self, event: AstrMessageEvent, query: list[str]
     ) -> str:
-        """主动把一段对话记录写入长期记忆。
+        """把你自己说的话或判断写入长期记忆。
 
-        平时对话会被自动记录并按批投递；只有当你判断某段内容值得立刻记住、
-        或发现它没被自动记录下来时，才调用这个工具补写。
+        这个工具记的是**你的第一人称内容**——你的承诺、结论、决定，不是用户
+        刚说的话（那些会自动记录）。只有当你判断某段内容值得立刻记住、或发现
+        它没被自动记录下来时，才调用这个工具补写。
 
         Args:
-            query(list[str]): 想要写入的原始对话记录，每条字符串是一行对话
+            query(list[str]): 你要记住的内容，每条字符串是一行，行内用你自己的口吻
         """
         # 同上：写之前就挡住。群聊里的发言属于多人，落进一对一记忆库是
         # 拿别人的话冒充这个人的过往。
@@ -219,15 +220,24 @@ class HindsightMemory(Star):
         # 进库、要么整批失败，不会留下「前两行进去了、后三行没有」的半批，
         # 返回给模型的文案才能说准。
         persona_id = await persona_from_conversation(self.context, event)
-        sender_id = event.get_sender_id()
-        sender_name = event.get_sender_name()
+        # 走到这里的内容是模型自己的口吻（「我答应明天提醒你」这类），说的是它
+        # 自己，不是用户。role 必须记成 llm：
+        # 1. speaker_of() 按 role 选称呼，记成 user 会让**用户昵称**盖到 AI 的话
+        #    上，抽取出来就变成「小满答应明天提醒吃药」——AI 的承诺成了用户的
+        #    行为，之后召回时人格全错位。
+        # 2. content_hash 含 role，同一句话被双方各说一遍时不会撞唯一索引。
+        # 昵称这里存的是**来源值**（人格名），配置里的 llm_nickname 交给渲染层
+        # 覆盖（见 sync.speaker_of）：在记录阶段就把配置烤进库，第二层「库里
+        # 的昵称」就永远用不上，改配置也改不动历史记录。
+        bot_id = resolve_bot_id(event.message_obj.self_id, event.get_platform_id())
+        bot_name = bot_display_name(self.context, persona_id)
         # 同一个 now：这批内容是同一次调用的产物，时间戳与 document_id 都该一致。
         now = datetime.now()
         rows = [
             build_raw_message(
-                role="user",
-                sender_id=sender_id,
-                sender_name=sender_name,
+                role="llm",
+                sender_id=bot_id,
+                sender_name=bot_name,
                 text=line,
                 umo=event.unified_msg_origin,
                 persona_id=persona_id or "",

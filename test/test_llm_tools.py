@@ -8,7 +8,10 @@
 
 import pytest
 
+from types import SimpleNamespace
+
 from astrbot_plugin_hindsight_memory import main as plugin_main
+from astrbot_plugin_hindsight_memory.core.capture import _DEFAULT_BOT_NAME
 from astrbot_plugin_hindsight_memory.core.recorder import SaveResult
 from astrbot_plugin_hindsight_memory.hindsight.sync import SyncOutcome
 from astrbot_plugin_hindsight_memory.main import HindsightMemory
@@ -87,12 +90,17 @@ class FakeEvent:
         self.unified_msg_origin = "qq_official:FriendMessage:u1"
         self._sender_id = "10001"
         self._sender_name = "小满"
+        # proactive_retain 记的是机器人自己的发言，需要从 message_obj 取 self_id。
+        self.message_obj = SimpleNamespace(self_id="bot-1")
 
     def get_sender_id(self) -> str:
         return self._sender_id
 
     def get_sender_name(self) -> str:
         return self._sender_name
+
+    def get_platform_id(self) -> str:
+        return "qq_official"
 
     def is_private_chat(self) -> bool:
         return self.private
@@ -261,18 +269,33 @@ class TestProactiveRetain:
         assert [raw.raw_message for raw in submitted] == ["第一句", "第二句"]
         assert submitted == list(recorder.batches[0])
 
-    async def test_saved_rows_carry_sender_and_persona(self) -> None:
+    async def test_saved_rows_are_attributed_to_the_bot(self) -> None:
         recorder = FakeRecorder()
         fake = make_self(recorder=recorder)
 
         await HindsightMemory.proactive_retain(fake, FakeEvent(), ["我叫小满"])
 
         raw = recorder.batches[0][0]
-        assert raw.role == "user"
-        assert raw.sender_id == "10001"
-        assert raw.sender_name == "小满"
+        # 这个工具记的是模型自己的第一人称内容（承诺、结论、决定），不是用户
+        # 刚说的话。记成 user 的后果不只是 role 一列错了：speaker_of() 按 role
+        # 选称呼，用户昵称会盖到 AI 的话上，抽取出来就变成「小满答应明天…」。
+        assert raw.role == "llm"
+        # FakeSelf.context 是 object()，取不到 persona_manager → 走降级分支。
+        assert raw.sender_id == "bot-1"
+        assert raw.sender_name == _DEFAULT_BOT_NAME
         assert raw.persona_id == "default"
         assert raw.document_id.endswith(":qq_official:FriendMessage:u1")
+
+    async def test_retain_rows_never_carry_the_user_nickname(self) -> None:
+        recorder = FakeRecorder()
+        fake = make_self(recorder=recorder)
+
+        await HindsightMemory.proactive_retain(fake, FakeEvent(), ["我答应明天提醒你"])
+
+        raw = recorder.batches[0][0]
+        # 防回归：这两条一旦同时出现，说明 role 又被写回 user 了。
+        assert raw.sender_name != "小满"
+        assert raw.sender_id != "10001"
 
     async def test_blank_lines_are_dropped(self) -> None:
         recorder = FakeRecorder()
