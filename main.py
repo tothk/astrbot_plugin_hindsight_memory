@@ -138,7 +138,22 @@ class HindsightMemory(Star):
         # 是隐私事故。
         if event.get_message_type() != MessageType.FRIEND_MESSAGE:
             return
-        text = req.prompt or event.message_str
+        # 检索词取事件里的用户原话，不取 req.prompt。req.prompt 的源头虽然
+        # 也是 event.message_str（astr_main_agent/request.py:273），但钩子跑
+        # 之前它已经被改写过：
+        # 1. 配置了 prompt_prefix 会被拼上人设前缀（request.py:50-63 的
+        #    apply_prompt_prefix，prepare_request 在 :608 调），检索词变成
+        #    「前缀 + 原话」，前缀会稀释 embedding。
+        # 2. 带附件时没有正文，它会被填成占位符——"<attachment>"
+        #    （request.py:578）、"[Image unavailable]"
+        #    （utils/image_input.py:135）、"总结一下文件里面讲了什么？"
+        #    （request.py:152）。拿这些去检索只会白跑一次请求。
+        # 3. 其它插件也可能在 OnLLMRequestEvent 里改写它。
+        # 所以不做 req.prompt 兜底：message_str 为空就说明这条消息本来没有
+        # 可检索的文本。message_str 在 waking_check/stage.py:132-136 已剥掉
+        # 唤醒前缀，AgentWakeupEvent 也填了它（agent_wakeup_event.py:70），
+        # 不需要兜底。
+        text = event.message_str
         if not text:
             return
         memory = await self._memory.recall_for(text)
