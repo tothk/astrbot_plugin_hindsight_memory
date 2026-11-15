@@ -23,7 +23,11 @@ import httpx
 #   - 写入走异步模式（async=True），HTTP 只负责排队，很快返回，用默认值即可；
 #   - 召回用短超时，宁可这轮不带记忆，也不要让用户干等。
 DEFAULT_TIMEOUT = 30.0
-RECALL_TIMEOUT = 10.0
+# 召回会在用户**每句话之前**执行，慢了就直接体现在回复延迟上。这里给一个
+# 远小于 DEFAULT_TIMEOUT 的默认值。注意它只是「没显式传 timeout 时」的兜底：
+# core/recall.py 调用时显式传了更小的值（_REQUEST_TIMEOUT），以保证超时由
+# HTTP 层报出来、而不是被外层 wait_for 掐断。
+RECALL_TIMEOUT = 2.5
 
 
 class HindsightError(Exception):

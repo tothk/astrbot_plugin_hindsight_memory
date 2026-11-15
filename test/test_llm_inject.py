@@ -182,7 +182,7 @@ class TestSkips:
 
         assert req.extra_user_content_parts == []
 
-    async def test_empty_prompt_skips_recall(self) -> None:
+    async def test_no_text_skips_recall(self) -> None:
         memory = FakeMemory()
         req = build_request(prompt="")
 
@@ -193,20 +193,33 @@ class TestSkips:
 
 
 class TestQuerySource:
-    async def test_uses_prompt_when_present(self) -> None:
+    """检索词只认事件里的用户原话。
+
+    ``req.prompt`` 在钩子跑之前会被宿主改写（prompt_prefix 拼接、附件占位
+    符），拿它检索会稀释 query 或白跑一次请求，所以它不参与取值。
+    """
+
+    async def test_prefers_event_message_over_prompt(self) -> None:
         memory = FakeMemory()
 
-        await call_hook(memory, FakeEvent(message_str="事件里的正文"), build_request("请求里的正文"))
-
-        assert memory.queries == ["请求里的正文"]
-
-    async def test_falls_back_to_event_message(self) -> None:
-        memory = FakeMemory()
-        req = build_request(prompt="")
-
-        await call_hook(memory, FakeEvent(message_str="事件里的正文"), req)
+        await call_hook(
+            memory,
+            FakeEvent(message_str="事件里的正文"),
+            build_request("前缀·请求里的正文"),
+        )
 
         assert memory.queries == ["事件里的正文"]
+
+    async def test_ignores_prompt_when_event_has_no_text(self) -> None:
+        # 带附件时 message_str 为空，prompt 被填成占位符。回退到它等于拿
+        # "[Image unavailable]" 去检索记忆。
+        memory = FakeMemory()
+        req = build_request("[Image unavailable]")
+
+        await call_hook(memory, FakeEvent(message_str=""), req)
+
+        assert memory.queries == []
+        assert req.extra_user_content_parts == []
 
 
 class TestEndToEnd:
